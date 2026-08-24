@@ -9,6 +9,7 @@ from unittest import mock
 from cache import ResultCache
 from job_manager import JobCancelled, JobManager, JobQueueFull
 from models import TranscribeRequest
+from transcribe_service import parse_bilibili_video_url, resolve_bilibili_audio
 
 
 class JobManagerTests(unittest.TestCase):
@@ -123,6 +124,25 @@ class CacheTests(unittest.TestCase):
             self.assertTrue(Path(directory, "old.json").exists())
             self.assertFalse(Path(directory, "recent.json").exists())
             self.assertTrue(Path(directory, "new.json").exists())
+
+
+class BilibiliResolverTests(unittest.TestCase):
+    def test_parse_video_and_page(self):
+        self.assertEqual(parse_bilibili_video_url("https://www.bilibili.com/video/BV1sc411V7ZE?p=2"), ("BV1sc411V7ZE", 2))
+        self.assertIsNone(parse_bilibili_video_url("https://example.com/video/BV1sc411V7ZE"))
+
+    def test_resolve_uses_selected_page_and_best_audio(self):
+        video = {"code": 0, "data": {"title": "Song", "owner": {"name": "Singer"}, "pages": [{"page": 2, "cid": 22}]}}
+        play = {"code": 0, "data": {"dash": {"audio": [{"bandwidth": 1, "baseUrl": "https://cdn/low"}, {"bandwidth": 2, "base_url": "https://cdn/high"}]}}}
+        def response(payload):
+            value = mock.MagicMock()
+            value.__enter__.return_value.read.return_value = json.dumps(payload).encode()
+            return value
+        with mock.patch("transcribe_service.urlopen", side_effect=[response(video), response(play)]) as opened:
+            result = resolve_bilibili_audio("https://www.bilibili.com/video/BV1sc411V7ZE?p=2", 10)
+        self.assertEqual(result["audio_url"], "https://cdn/high")
+        self.assertEqual(result["video_info"]["title"], "Song")
+        self.assertIn("cid=22", opened.call_args_list[1].args[0].full_url)
 
 
 class ServerAuthTests(unittest.TestCase):
