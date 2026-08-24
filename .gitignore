@@ -1,0 +1,15 @@
+.venv/
+.models/
+.hf-cache/
+.cache/
+.dbg/
+.transcribe-cache/
+__pycache__/
+*.py[cod]
+debug-events.json
+dist/
+.env
+.env.*
+*.pem
+*.key
+deploy-*.tar.gz

@@ -1,0 +1,20 @@
+[Unit]
+Description=Sing Reactor transcription service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=singreactor
+Group=singreactor
+WorkingDirectory=/opt/singreactor/app
+EnvironmentFile=/etc/singreactor.env
+ExecStart=/opt/singreactor/venv/bin/uvicorn server:app --host 127.0.0.1 --port 8765
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+PrivateTmp=true
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

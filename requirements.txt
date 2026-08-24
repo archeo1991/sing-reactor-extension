@@ -1,0 +1,4 @@
+fastapi==0.139.1
+uvicorn==0.51.0
+yt-dlp==2026.7.4
+faster-whisper==1.2.1

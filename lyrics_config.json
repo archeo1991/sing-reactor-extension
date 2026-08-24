@@ -1,0 +1,180 @@
+{
+  "schema_version": 1,
+  "title_cleanup": {
+    "removable_terms": [
+      "hi[\\s-]?res",
+      "official\\s*(?:music\\s*)?video",
+      "official\\s*audio",
+      "music\\s*video",
+      "4k",
+      "8k",
+      "hdr",
+      "uhd",
+      "2160p",
+      "1080p",
+      "720p",
+      "hd",
+      "hq",
+      "lossless",
+      "live",
+      "lyrics?",
+      "lyric\\s*video",
+      "audio",
+      "mv",
+      "无损(?:音质)?",
+      "高音质",
+      "超清",
+      "修复(?:版)?",
+      "重制(?:版)?",
+      "完整版",
+      "纯享版?",
+      "动态歌词",
+      "中英字幕",
+      "中字",
+      "字幕",
+      "歌词",
+      "ktv",
+      "卡拉ok",
+      "原文",
+      "罗马音",
+      "人声\\s*on",
+      "伴奏",
+      "low",
+      "现场版?",
+      "演唱会版?",
+      "翻唱",
+      "首发",
+      "发现",
+      "神曲",
+      "开口跪",
+      "收藏"
+    ],
+    "date_patterns": [
+      "\\b(?:19|20)\\d{6}\\b",
+      "\\b\\d{2}[-./]\\d{1,2}[-./]\\d{1,2}\\b"
+    ],
+    "venue_suffix_patterns": [
+      "\\s*@\\s*[^|｜丨《》]+$"
+    ]
+  },
+  "uploader": {
+    "trusted_official_markers": [
+      "official",
+      "官方",
+      "歌手",
+      "音乐人",
+      "乐队",
+      "band",
+      "singer",
+      "artist"
+    ]
+  },
+  "metadata": {
+    "extract_book_title": true,
+    "bracket_patterns": [
+      "【([^】]*)】",
+      "\\[([^\\]]*)\\]",
+      "（([^）]*)）",
+      "\\(([^)]*)\\)"
+    ],
+    "discovery_title_patterns": [
+      "发现\\s*《\\s*([^《》]{1,80})\\s*》"
+    ],
+    "book_title_pattern": "《\\s*([^《》]{1,80}?)\\s*》",
+    "artist_title_separators": [
+      "\\s+-\\s+"
+    ]
+  },
+  "search": {
+    "max_queries": 4,
+    "results_per_query": 3,
+    "max_candidates": 8,
+    "lrclib_enabled": true,
+    "lrclib_max_results": 6,
+    "query_templates": {
+      "with_artist": [
+        "{artist} {song} 歌词 LRC",
+        "{song} {artist} LRC"
+      ],
+      "without_artist": [
+        "{song} 歌词 LRC"
+      ],
+      "latin": [
+        "{song} {artist} lyrics lrc"
+      ],
+      "non_latin": []
+    }
+  },
+  "candidate_filter": {
+    "metadata_line_patterns": [
+      "^(?:作词|作曲|编曲|制作人|制作|监制|演唱|歌手|歌曲|专辑|混音|母带|录音|和声|吉他|贝斯|鼓|词\\s*[:：]|曲\\s*[:：]|copyright|all rights reserved|未经许可|版权|广告|扫码|下载|关注|登录|注册|首页|评论|分享|收藏|播放|上一首|下一首)"
+    ],
+    "noise_patterns": [
+      "(?:条评论|发表评论|热门评论|相关推荐|更多精彩|返回首页|隐私政策|用户协议|ICP备|©\\s*\\d{4}|安全访问检测|正在验证浏览器|异常访问|点击继续访问|纯歌词(?:版本)?|LRC歌词|复制)"
+    ],
+    "ui_only_patterns": [
+      "^(?:[📝🎵📋\\s]*)(?:纯歌词(?:版本)?|LRC歌词|复制|安全访问检测|正在验证浏览器|检测到异常访问来源.*|点击继续访问)$"
+    ],
+    "alignment_confidence_threshold": 0.64,
+    "source_title_similarity_threshold": 0.82,
+    "artist_match_threshold": 0.88,
+    "strong_audio_coverage": 0.72,
+    "strong_audio_average_confidence": 0.82,
+    "strong_audio_high_confidence_ratio": 0.8,
+    "text_consistency_min_matches": 2,
+    "text_consistency_average_confidence": 0.82,
+    "minimum_candidate_lines": 2,
+    "page_lines_preferred_minimum": 3,
+    "combined_snippet_minimum": 3,
+    "text_only_minimum_ratio": 0.25,
+    "text_only_minimum_multiple": 2,
+    "text_only_minimum_single": 1
+  },
+  "script_tracks": {
+    "enabled": true,
+    "priority": [
+      "ja",
+      "han",
+      "latin",
+      "other"
+    ],
+    "minimum_lines": 3,
+    "minimum_substantial_tracks": 2,
+    "preferred_source_minimum_lines": 6
+  },
+  "lrc_sync": {
+    "similarity_threshold": 0.68,
+    "single_anchor_threshold": 0.9,
+    "short_clip_max_duration": 12.0,
+    "offset_cluster_tolerance": 0.75,
+    "max_offset_spread": 1.5,
+    "local_support_similarity": 0.72,
+    "local_support_time_tolerance": 1.5,
+    "repeated_fallback_similarity": 0.25,
+    "prefix_tolerance": 1.5,
+    "tail_allowance_lines": 1,
+    "tail_allowance_seconds": 8.0,
+    "min_clipped_duration": 0.35,
+    "min_retained_ratio": 0.2,
+    "pause_split_threshold": 0.45,
+    "minimum_piece_duration": 0.05,
+    "line_end_padding": 0.2,
+    "display_lead_seconds": -0.2,
+    "preserve_between_anchors": true
+  },
+  "timeline_quality": {
+    "min_lines": 2,
+    "min_anchored_lines": 2,
+    "high_confidence_threshold": 0.64,
+    "high_confidence_ratio": 0.7,
+    "average_confidence": 0.72,
+    "coverage": 0.62,
+    "single_line_coverage": 0.65,
+    "single_line_average_confidence": 0.78,
+    "per_line_minimum_confidence": 0.6,
+    "single_anchor_max_units": 3
+  },
+  "fallback": {
+    "enable_text_only": true
+  }
+}
