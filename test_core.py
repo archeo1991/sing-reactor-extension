@@ -10,7 +10,11 @@ from cache import ResultCache
 from job_manager import JobCancelled, JobManager, JobQueueFull
 from models import TranscribeRequest
 from transcribe_service import infer_metadata_language, parse_bilibili_video_url, resolve_bilibili_audio, transcribe_request
-from server import extract_song_metadata, fetch_lrclib_candidates
+from server import (
+    _empty_correction, _source_matches_subject, correct_segments_from_web, extract_song_metadata,
+    fetch_bilibili_subtitle_candidates, fetch_lrclib_candidates, fetch_netease_candidates,
+    sync_lrc_to_audio,
+)
 
 
 class JobManagerTests(unittest.TestCase):
@@ -180,6 +184,14 @@ class BilibiliResolverTests(unittest.TestCase):
         self.assertEqual(metadata["duration"], 267)
         self.assertEqual(infer_metadata_language(info), "zh")
 
+    def test_metadata_version_flags_are_preserved(self):
+        metadata = extract_song_metadata("歌手《歌曲》现场翻唱 Remix 伴奏", "歌手", {"duration": 30, "metadata_language": "zh"})
+        self.assertTrue(metadata["is_live"])
+        self.assertTrue(metadata["is_cover"])
+        self.assertTrue(metadata["is_instrumental"])
+        self.assertIn("live", metadata["version_terms"])
+        self.assertEqual(metadata["language"], "zh")
+
     def test_metadata_language_falls_back_to_auto_for_noise_only(self):
         info = {"title": "4K MV", "description": "", "tags": ["HD"]}
         self.assertEqual(infer_metadata_language(info), "auto")
@@ -240,6 +252,11 @@ class LrclibCandidateTests(unittest.TestCase):
     def response(items):
         return json.dumps(items), "https://lrclib.net/api/search"
 
+    def test_title_extracts_artist_with_unicode_dash_suffix(self):
+        metadata = extract_song_metadata("【4K/歌词字幕】黄霄雲—《此生不换》-20260829宇宙无敌号2.0杭州演唱会")
+        self.assertEqual(metadata["artist"], "黄霄雲")
+        self.assertEqual(metadata["song_title"], "此生不换")
+
     def test_metadata_similarity_precedes_duration_and_filters_wrong_track(self):
         items = [
             {"id": 1, "trackName": "错误歌曲", "artistName": "青鸟飞鱼", "duration": 267, "plainLyrics": "wrong"},
@@ -250,6 +267,15 @@ class LrclibCandidateTests(unittest.TestCase):
             candidates = fetch_lrclib_candidates({"song_title": "此生不换", "artist": "青鸟飞鱼", "duration": 267})
         self.assertEqual([item["url"].rsplit("/", 1)[-1] for item in candidates], ["2", "3"])
 
+    def test_artist_query_also_runs_song_only_fallback(self):
+        responses = [self.response([]), self.response([
+            {"id": 6, "trackName": "此生不换", "artistName": "青鸟飞鱼", "duration": 267, "plainLyrics": "lyrics"},
+        ])]
+        with mock.patch("server._fetch_public_text", side_effect=responses) as fetch:
+            candidates = fetch_lrclib_candidates({"song_title": "此生不换", "artist": "黄霄雲", "duration": 267})
+        self.assertEqual(fetch.call_count, 2)
+        self.assertEqual([item["url"].rsplit("/", 1)[-1] for item in candidates], ["6"])
+
     def test_missing_artist_allows_strong_track_match(self):
         items = [
             {"id": 4, "trackName": "此生不换", "artistName": "", "duration": 270, "plainLyrics": "lyrics"},
@@ -258,6 +284,134 @@ class LrclibCandidateTests(unittest.TestCase):
         with mock.patch("server._fetch_public_text", return_value=self.response(items)):
             candidates = fetch_lrclib_candidates({"song_title": "此生不换", "artist": "", "duration": 267})
         self.assertEqual([item["url"].rsplit("/", 1)[-1] for item in candidates], ["4"])
+
+    def test_cover_candidate_requires_strong_lrc_anchors(self):
+        metadata = {"song_title": "此生不换", "artist": "黄霄雲"}
+        strong_rank = (4, 1.0, 0.9, 2, 1.0)
+        weak_rank = (1, 1.0, 0.9, 1, 1.0)
+        self.assertTrue(_source_matches_subject("此生不换 - 青鸟飞鱼", metadata, strong_rank))
+        self.assertFalse(_source_matches_subject("此生不换 - 青鸟飞鱼", metadata, weak_rank))
+        self.assertFalse(_source_matches_subject("完全不同 - 青鸟飞鱼", metadata, strong_rank))
+
+
+class UnifiedLyricsTests(unittest.TestCase):
+    def test_bilibili_subtitle_priority_and_parse(self):
+        listing = {"data": {"subtitle": {"subtitles": [
+            {"lan": "en", "lan_doc": "English", "subtitle_url": "//sub/en"},
+            {"lan": "zh-CN", "lan_doc": "中文（自动生成）", "subtitle_url": "//sub/auto"},
+            {"lan": "zh-CN", "lan_doc": "中文", "subtitle_url": "//sub/zh"},
+        ]}}}
+        body = json.dumps({"body": [{"from": 1.2, "to": 2.5, "content": "第一句"}, {"from": 3, "to": 4, "content": "第二句"}]})
+        responses = [(json.dumps(listing), "https://api.bilibili.com/x/player/v2"), (body, "https://sub/en"), (body, "https://sub/auto"), (body, "https://sub/zh")]
+        info = {"bvid": "BV1", "cid": 2, "title": "歌曲", "uploader": "歌手", "duration": 10}
+        with mock.patch("server._fetch_public_text", side_effect=responses):
+            candidates = fetch_bilibili_subtitle_candidates(info)
+        self.assertEqual(candidates[0]["subtitle_label"], "中文")
+        self.assertFalse(candidates[0]["is_automatic"])
+        self.assertIn("[00:01.20]第一句", candidates[0]["lrc_text"])
+
+    def test_bilibili_subtitle_candidate_matches_subject_and_preserves_artist(self):
+        listing = {"data": {"subtitle": {"subtitles": [
+            {"lan": "zh-CN", "lan_doc": "中文", "subtitle_url": "//sub/zh"},
+        ]}}}
+        body = json.dumps({"body": [
+            {"from": 1.2, "to": 2.5, "content": "第一句"},
+            {"from": 3, "to": 4, "content": "第二句"},
+        ]})
+        info = {
+            "bvid": "BV1", "cid": 2, "title": "青鸟飞鱼《此生不换》", "uploader": "影视音乐收藏",
+            "duration": 10,
+        }
+        with mock.patch("server._fetch_public_text", side_effect=[
+            (json.dumps(listing), "https://api.bilibili.com/x/player/v2"),
+            (body, "https://sub/zh"),
+        ]):
+            candidates = fetch_bilibili_subtitle_candidates(info)
+        candidate = candidates[0]
+        metadata = extract_song_metadata(info["title"], info["uploader"], info)
+        self.assertEqual(candidate["track_name"], "此生不换")
+        self.assertEqual(candidate["artist_name"], "青鸟飞鱼")
+        self.assertEqual(candidate["subtitle_label"], "中文")
+        self.assertIn("此生不换", candidate["title"])
+        self.assertIn("青鸟飞鱼", candidate["title"])
+        self.assertTrue(_source_matches_subject(
+            candidate["title"], metadata, (2, 1.0, 0.9, 2, 1.0)
+        ))
+
+    def test_netease_candidate_is_unified(self):
+        search = {"result": {"songs": [{"id": 7, "name": "歌曲", "duration": 10000, "artists": [{"name": "歌手"}]}]}}
+        lyric = {"lrc": {"lyric": "[00:01.00]第一句"}}
+        with mock.patch("server._fetch_public_text", side_effect=[(json.dumps(search), "search"), (json.dumps(lyric), "lyric")]):
+            candidates = fetch_netease_candidates({"song_title": "歌曲", "artist": "歌手", "duration": 10})
+        self.assertEqual(candidates[0]["provider"], "netease")
+        self.assertEqual(candidates[0]["track_name"], "歌曲")
+        self.assertGreater(candidates[0]["metadata_score"], 0.8)
+
+    def test_linear_timeline_wins_and_short_span_stays_offset(self):
+        lrc = [{"start": float(i * 10), "end": float(i * 10 + 4), "text": f"第{i}句歌词"} for i in range(5)]
+        whisper = [{"start": 2 + 1.02 * i * 10, "end": 5 + 1.02 * i * 10, "text": f"第{i}句歌词"} for i in range(5)]
+        _, details = sync_lrc_to_audio(lrc, whisper, 0, 60)
+        self.assertEqual(details["timeline_model"], "linear")
+        self.assertAlmostEqual(details["scale"], 1.02, places=2)
+        _, short = sync_lrc_to_audio(lrc[:3], whisper[:3], 0, 30)
+        self.assertEqual(short["timeline_model"], "offset")
+
+    def test_long_span_linear_timeline_ignores_raw_offset_spread(self):
+        lrc = [{"start": float(i * 20), "end": float(i * 20 + 4), "text": f"长歌第{i}句"} for i in range(11)]
+        whisper = [
+            {"start": 2 + 1.02 * i * 20, "end": 6 + 1.02 * i * 20, "text": f"长歌第{i}句"}
+            for i in range(11)
+        ]
+        synced, details = sync_lrc_to_audio(lrc, whisper, 0, 215)
+        self.assertEqual(details["timeline_model"], "linear")
+        self.assertTrue(details["accepted"])
+        self.assertGreater(details["offset_spread"], 1.5)
+        self.assertAlmostEqual(details["scale"], 1.02, places=3)
+        self.assertLess(details["rmse"], 0.01)
+        self.assertEqual(len(synced), len(lrc))
+
+    def test_linear_timeline_rejects_high_rmse_anchors(self):
+        lrc = [{"start": float(i * 50), "end": float(i * 50 + 4), "text": f"异常第{i}句"} for i in range(5)]
+        actual_starts = [2, 53, 130, 155, 206]
+        whisper = [
+            {"start": actual_starts[i], "end": actual_starts[i] + 4, "text": f"异常第{i}句"}
+            for i in range(5)
+        ]
+        _, details = sync_lrc_to_audio(lrc, whisper, 0, 220)
+        self.assertNotEqual(details["timeline_model"], "linear")
+
+    def test_bilibili_selection_fields_use_extracted_source_artist(self):
+        segments = [
+            {"start": 1.0, "end": 2.5, "text": "第一句"},
+            {"start": 3.0, "end": 4.5, "text": "第二句"},
+        ]
+        candidate = {
+            "provider": "bilibili_subtitle", "title": "青鸟飞鱼 此生不换 B站字幕：中文",
+            "track_name": "此生不换", "artist_name": "青鸟飞鱼", "duration": 10,
+            "source_url": "https://sub/zh", "url": "https://sub/zh",
+            "lrc_text": "[00:01.00]第一句\n[00:03.00]第二句", "plain_text": "第一句\n第二句",
+            "metadata_score": 1.0, "subtitle_label": "中文",
+        }
+        info = {"title": "青鸟飞鱼《此生不换》", "uploader": "影视音乐收藏", "duration": 10}
+        with mock.patch("server.fetch_bilibili_subtitle_candidates", return_value=[candidate]), \
+                mock.patch("server.fetch_netease_candidates", return_value=[]), \
+                mock.patch("server.fetch_lrclib_candidates", return_value=[]):
+            _, correction = correct_segments_from_web(
+                segments, info["title"], info["uploader"], video_info=info, clip_start=0, clip_end=10,
+            )
+        self.assertTrue(correction["applied"])
+        self.assertEqual(correction["provider"], "bilibili_subtitle")
+        self.assertEqual(correction["metadata"]["song_title"], "此生不换")
+        self.assertEqual(correction["metadata"]["detected_artist"], "青鸟飞鱼")
+        self.assertEqual(correction["metadata"]["source_artist"], "青鸟飞鱼")
+
+    def test_empty_correction_has_compatible_extended_fields(self):
+        correction = _empty_correction("query", "reason")
+        self.assertEqual(correction["mode"], "none")
+        self.assertIn("provider", correction)
+        self.assertIn("metadata", correction)
+        self.assertIn("timeline", correction)
+        self.assertEqual(correction["attempted_providers"], [])
 
 
 class ServerAuthTests(unittest.TestCase):

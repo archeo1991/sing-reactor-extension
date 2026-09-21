@@ -91,6 +91,8 @@
     "max_candidates": 8,
     "lrclib_enabled": true,
     "lrclib_max_results": 6,
+    "netease_enabled": true,
+    "netease_max_results": 5,
     "query_templates": {
       "with_artist": [
         "{artist} {song} 歌词 LRC",
@@ -160,7 +162,18 @@
     "minimum_piece_duration": 0.05,
     "line_end_padding": 0.2,
     "display_lead_seconds": -0.2,
-    "preserve_between_anchors": true
+    "preserve_between_anchors": true,
+    "linear_min_anchors": 4,
+    "linear_min_span": 20.0,
+    "linear_scale_min": 0.94,
+    "linear_scale_max": 1.06,
+    "linear_rmse_improvement": 0.15
+  },
+  "provider_quality": {
+    "bilibili_subtitle": 0.72,
+    "netease": 0.85,
+    "lrclib": 0.9,
+    "web": 0.55
   },
   "timeline_quality": {
     "min_lines": 2,

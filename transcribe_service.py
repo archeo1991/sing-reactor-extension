@@ -115,6 +115,8 @@ def resolve_bilibili_audio(url, timeout):
         "audio_url": audio_url, "headers": BILIBILI_HEADERS,
         "video_info": {
             "id": bvid,
+            "bvid": bvid,
+            "cid": page["cid"],
             "title": page_title or total_title,
             "page_title": page_title,
             "page_number": page_number,
@@ -219,7 +221,9 @@ def transcribe_request(
                     downloaded = candidates[0]
                 if downloaded.stat().st_size > settings.max_download_bytes:
                     raise HTTPException(status_code=413, detail="下载文件超过大小上限")
-            metadata_language = infer_metadata_language(video_info)
+            metadata_language = str(video_info.get("metadata_language") or infer_metadata_language(video_info))
+            video_info = dict(video_info)
+            video_info["metadata_language"] = metadata_language
             video_title = str(video_info.get("title") or "")
             uploader = str(video_info.get("uploader") or video_info.get("channel") or "")
             song_metadata = extract_song_metadata(video_title, uploader, video_info)
@@ -305,9 +309,10 @@ def transcribe_request(
             for segment in result:
                 segment.setdefault("corrected", False)
                 segment.setdefault("confidence", 0.0)
-            final = {"segments": result, "language": whisper_info.language, "correction": correction, "cacheHit": False}
+            final = {"segments": result, "language": whisper_info.language, "correction": correction, "cacheHit": False,
+                     "metadata": {"video_info": video_info, "song_metadata": song_metadata}}
             stage_callback("cache_write")
-            cache.set(cache_key, {"raw": {"segments": raw_segments, "words": whisper_words}, "final": final})
+            cache.set(cache_key, {"raw": {"segments": raw_segments, "words": whisper_words, "video_info": video_info, "song_metadata": song_metadata}, "final": final})
             return final
     except JobCancelled:
         raise

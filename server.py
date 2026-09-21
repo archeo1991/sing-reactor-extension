@@ -21,7 +21,7 @@ import xml.etree.ElementTree as ET
 from difflib import SequenceMatcher
 from html.parser import HTMLParser
 from urllib.error import HTTPError, URLError
-from urllib.parse import parse_qs, quote_plus, unquote, urljoin, urlparse
+from urllib.parse import parse_qs, quote_plus, unquote, urlencode, urljoin, urlparse
 
 
 
@@ -82,7 +82,7 @@ def _compile_cfg_pattern(path):
 
 if _cfg("schema_version", int) != 1:
     raise ValueError("歌词配置项 schema_version 必须为 1")
-for _section in ("title_cleanup", "uploader", "metadata", "search", "candidate_filter", "script_tracks", "lrc_sync", "timeline_quality", "fallback"):
+for _section in ("title_cleanup", "uploader", "metadata", "search", "candidate_filter", "script_tracks", "lrc_sync", "provider_quality", "timeline_quality", "fallback"):
     _cfg(_section, dict)
 for _path in (
     "title_cleanup.removable_terms", "title_cleanup.date_patterns", "title_cleanup.venue_suffix_patterns",
@@ -93,19 +93,19 @@ for _path in (
 ):
     _cfg(_path, list)
 for _path in (
-    "metadata.extract_book_title", "search.lrclib_enabled", "script_tracks.enabled",
+    "metadata.extract_book_title", "search.lrclib_enabled", "search.netease_enabled", "script_tracks.enabled",
     "lrc_sync.preserve_between_anchors", "fallback.enable_text_only",
 ):
     _cfg(_path, bool)
 for _path in (
-    "search.max_queries", "search.results_per_query", "search.max_candidates", "search.lrclib_max_results",
+    "search.max_queries", "search.results_per_query", "search.max_candidates", "search.lrclib_max_results", "search.netease_max_results",
     "candidate_filter.minimum_candidate_lines", "candidate_filter.page_lines_preferred_minimum",
     "candidate_filter.combined_snippet_minimum", "candidate_filter.text_consistency_min_matches",
     "candidate_filter.text_only_minimum_multiple", "candidate_filter.text_only_minimum_single",
     "script_tracks.minimum_lines", "script_tracks.minimum_substantial_tracks",
     "script_tracks.preferred_source_minimum_lines", "lrc_sync.tail_allowance_lines",
     "timeline_quality.min_lines", "timeline_quality.min_anchored_lines",
-    "timeline_quality.single_anchor_max_units",
+    "timeline_quality.single_anchor_max_units", "lrc_sync.linear_min_anchors",
 ):
     _cfg(_path, int)
 for _path in (
@@ -118,13 +118,14 @@ for _path in (
     "lrc_sync.local_support_time_tolerance", "lrc_sync.repeated_fallback_similarity",
     "lrc_sync.prefix_tolerance", "lrc_sync.tail_allowance_seconds", "lrc_sync.min_clipped_duration",
     "lrc_sync.min_retained_ratio", "lrc_sync.pause_split_threshold", "lrc_sync.minimum_piece_duration",
-    "lrc_sync.line_end_padding", "timeline_quality.high_confidence_threshold",
+    "lrc_sync.line_end_padding", "lrc_sync.linear_min_span", "lrc_sync.linear_scale_min", "lrc_sync.linear_scale_max", "lrc_sync.linear_rmse_improvement", "timeline_quality.high_confidence_threshold",
     "timeline_quality.high_confidence_ratio", "timeline_quality.average_confidence", "timeline_quality.coverage",
     "timeline_quality.single_line_coverage", "timeline_quality.single_line_average_confidence",
     "timeline_quality.per_line_minimum_confidence",
 ):
     _cfg_number(_path)
 _cfg("metadata.book_title_pattern", str)
+_cfg("provider_quality", dict)
 _cfg("search.query_templates", dict)
 for _category in ("with_artist", "without_artist", "latin", "non_latin"):
     _templates = _cfg(f"search.query_templates.{_category}", list)
@@ -440,7 +441,7 @@ def _compact_title_part(value):
     value = VENUE_SUFFIX_RE.sub(" ", value)
     value = re.sub(r"[【】\[\]（）(){}]+", " ", value)
     value = re.sub(r"(?:\+|/)+", " ", value)
-    return re.sub(r"\s+", " ", value).strip(" -_·:：")
+    return re.sub(r"\s+", " ", value).strip(" -_·:：—–")
 
 
 def _clean_video_title(title):
@@ -602,12 +603,33 @@ def _build_search_queries(song_title, artist=""):
 
 
 def extract_song_metadata(title, uploader="", video_info=None):
-    artist, song_title = _extract_artist_and_song(title, uploader, video_info)
+    info = video_info if isinstance(video_info, dict) else {}
+    artist, song_title = _extract_artist_and_song(title, uploader, info)
+    raw_text = "\n".join([str(title or "")] + [str(info.get(key) or "") for key in (
+        "total_title", "original_title", "page_title", "title", "description", "dynamic",
+    )])
+    version_patterns = (
+        ("live", r"\blive\b|现场|現場|演唱会|演唱會|音乐节|音樂節"),
+        ("cover", r"\bcover\b|翻唱|试唱|試唱"),
+        ("instrumental", r"\binstrumental\b|伴奏|无人声|無人聲|off\s*vocal|karaoke"),
+        ("remix", r"\bremix\b|重混|混音版"),
+        ("remaster", r"\bremaster(?:ed)?\b|重制|修复版|修復版"),
+        ("edit", r"\bedit\b|剪辑版|剪輯版|片段"),
+    )
+    version_terms = [name for name, pattern in version_patterns if re.search(pattern, raw_text, re.I)]
+    language = str(info.get("metadata_language") or info.get("language") or "auto")
+    version = "/".join(version_terms)
     return {
         "song_title": song_title,
         "artist": artist,
-        "duration": (video_info or {}).get("duration") if isinstance(video_info, dict) else None,
+        "duration": info.get("duration"),
         "search_queries": _build_search_queries(song_title, artist),
+        "language": language,
+        "version": version,
+        "is_live": "live" in version_terms,
+        "is_cover": "cover" in version_terms,
+        "is_instrumental": "instrumental" in version_terms,
+        "version_terms": version_terms,
     }
 
 
@@ -1094,7 +1116,8 @@ def sync_lrc_to_audio(lrc_lines, whisper_segments, clip_start, clip_end):
     """用单调文本锚点估计歌曲 LRC 到视频音轨的唯一平移量。"""
     clip_start = float(clip_start if clip_start is not None else 0.0)
     clip_end = float(clip_end if clip_end is not None else clip_start)
-    details = {"anchor_count": 0, "offset_median": None, "offset_spread": None, "accepted": False}
+    details = {"anchor_count": 0, "offset_median": None, "offset_spread": None, "accepted": False,
+               "timeline_model": "offset", "offset": None, "scale": 1.0, "rmse": None}
     if not lrc_lines or not whisper_segments or clip_end <= clip_start:
         return [], details
     candidates = []
@@ -1138,16 +1161,60 @@ def sync_lrc_to_audio(lrc_lines, whisper_segments, clip_start, clip_end):
             anchors = path
     if not anchors:
         return [], details
+    display_lead = _cfg_number("lrc_sync.display_lead_seconds")
+    scale = 1.0
+    linear_accepted = False
+    linear_anchors, _ = _best_monotonic_anchor_path(candidates, len(whisper_segments))
+    if len(linear_anchors) >= _cfg("lrc_sync.linear_min_anchors", int):
+        linear_lrc_times = [float(lrc_lines[anchor["lrc_index"]]["start"]) for anchor in linear_anchors]
+        linear_actual_times = [anchor["actual_start"] for anchor in linear_anchors]
+        linear_span = max(linear_lrc_times) - min(linear_lrc_times)
+        if linear_span >= _cfg_number("lrc_sync.linear_min_span"):
+            linear_offsets = sorted(anchor["offset"] for anchor in linear_anchors)
+            middle = len(linear_offsets) // 2
+            linear_offset_median = (linear_offsets[middle] if len(linear_offsets) % 2
+                                    else (linear_offsets[middle - 1] + linear_offsets[middle]) / 2)
+            fixed_rmse = math.sqrt(sum(
+                (y - (x + linear_offset_median)) ** 2
+                for x, y in zip(linear_lrc_times, linear_actual_times)
+            ) / len(linear_anchors))
+            mean_x = sum(linear_lrc_times) / len(linear_lrc_times)
+            mean_y = sum(linear_actual_times) / len(linear_actual_times)
+            variance = sum((value - mean_x) ** 2 for value in linear_lrc_times)
+            fitted_scale = sum(
+                (x - mean_x) * (y - mean_y) for x, y in zip(linear_lrc_times, linear_actual_times)
+            ) / variance if variance else 1.0
+            fitted_offset = mean_y - fitted_scale * mean_x
+            fitted_rmse = math.sqrt(sum(
+                (y - (fitted_scale * x + fitted_offset)) ** 2
+                for x, y in zip(linear_lrc_times, linear_actual_times)
+            ) / len(linear_anchors))
+            average_similarity = sum(anchor["similarity"] for anchor in linear_anchors) / len(linear_anchors)
+            linear_accepted = (
+                _cfg_number("lrc_sync.linear_scale_min") <= fitted_scale <= _cfg_number("lrc_sync.linear_scale_max")
+                and fixed_rmse - fitted_rmse >= _cfg_number("lrc_sync.linear_rmse_improvement")
+                and fitted_rmse <= _cfg_number("lrc_sync.max_offset_spread")
+                and average_similarity >= _cfg_number("lrc_sync.similarity_threshold")
+            )
+            if linear_accepted:
+                anchors = linear_anchors
+                scale, model_offset, rmse = fitted_scale, fitted_offset, fitted_rmse
+                details["timeline_model"] = "linear"
     offsets = sorted(anchor["offset"] for anchor in anchors)
     middle = len(offsets) // 2
     offset_median = offsets[middle] if len(offsets) % 2 else (offsets[middle - 1] + offsets[middle]) / 2
     offset_spread = max(offsets) - min(offsets)
-    display_lead = _cfg_number("lrc_sync.display_lead_seconds")
+    if not linear_accepted:
+        model_offset = offset_median
+        rmse = math.sqrt(sum(
+            (anchor["actual_start"] - (float(lrc_lines[anchor["lrc_index"]]["start"]) + offset_median)) ** 2
+            for anchor in anchors
+        ) / len(anchors))
 
     def mapped_lrc_time(lrc_time, line_index):
-        return float(lrc_time) + offset_median - display_lead
+        return float(lrc_time) * scale + model_offset - display_lead
     short_clip = clip_end - clip_start <= _cfg_number("lrc_sync.short_clip_max_duration")
-    accepted = (
+    accepted = linear_accepted or (
         len(anchors) >= 2
         or short_clip and anchors[0]["similarity"] >= _cfg_number("lrc_sync.single_anchor_threshold")
     ) and offset_spread <= _cfg_number("lrc_sync.max_offset_spread")
@@ -1159,14 +1226,21 @@ def sync_lrc_to_audio(lrc_lines, whisper_segments, clip_start, clip_end):
     } for anchor in anchors]
     earliest_anchor = min(anchors, key=lambda item: item["lrc_index"])
     latest_anchor = max(anchors, key=lambda item: item["lrc_index"])
-    earliest_anchor_time = float(lrc_lines[earliest_anchor["lrc_index"]]["start"]) + offset_median
-    latest_anchor_time = float(lrc_lines[latest_anchor["lrc_index"]]["start"]) + offset_median
+    earliest_anchor_time = mapped_lrc_time(lrc_lines[earliest_anchor["lrc_index"]]["start"], earliest_anchor["lrc_index"]) + display_lead
+    latest_anchor_time = mapped_lrc_time(lrc_lines[latest_anchor["lrc_index"]]["start"], latest_anchor["lrc_index"]) + display_lead
     details.update({
         "anchor_count": len(anchors),
         "offset_median": round(offset_median, 4),
+        "offset": round(model_offset, 4),
+        "scale": round(scale, 6),
+        "rmse": round(rmse, 4),
         "offset_spread": round(offset_spread, 4),
         "accepted": accepted,
         "average_confidence": round(sum(item["similarity"] for item in anchors) / len(anchors), 4),
+        "high_confidence_ratio": round(sum(
+            item["similarity"] >= _cfg_number("timeline_quality.high_confidence_threshold")
+            for item in anchors
+        ) / len(anchors), 4),
         "reliable_anchors": reliable_anchors,
         "earliest_anchor_time": round(earliest_anchor_time, 3),
         "pruned_unanchored_count": 0,
@@ -1182,7 +1256,7 @@ def sync_lrc_to_audio(lrc_lines, whisper_segments, clip_start, clip_end):
     locally_supported_lines = {
         candidate["lrc_index"] for candidate in candidates
         if candidate["similarity"] >= _cfg_number("lrc_sync.local_support_similarity")
-        and abs(candidate["actual_start"] - (float(lrc_lines[candidate["lrc_index"]]["start"]) + offset_median)) <= _cfg_number("lrc_sync.local_support_time_tolerance")
+        and abs(candidate["actual_start"] - (mapped_lrc_time(lrc_lines[candidate["lrc_index"]]["start"], candidate["lrc_index"]) + display_lead)) <= _cfg_number("lrc_sync.local_support_time_tolerance")
     }
     repeated_fallback_support = set()
     for normalized, count in normalized_counts.items():
@@ -1209,7 +1283,7 @@ def sync_lrc_to_audio(lrc_lines, whisper_segments, clip_start, clip_end):
             repeated_fallback_support.update(index for similarity, index in local_matches
                                              if similarity == best_similarity)
     prefix_boundary_time = min(
-        [earliest_anchor_time] + [float(lrc_lines[index]["start"]) + offset_median
+        [earliest_anchor_time] + [mapped_lrc_time(lrc_lines[index]["start"], index) + display_lead
                                   for index in repeated_fallback_support]
     )
     details["earliest_anchor_time"] = round(prefix_boundary_time, 3)
@@ -1460,6 +1534,107 @@ def _rank_search_results(results, search_query):
     return candidates
 
 
+def _candidate_metadata(metadata, track_name, artist_name, duration, url, title, provider, lrc_text="", plain_text="", **extra):
+    track_score = lyric_similarity(metadata.get("song_title", ""), track_name or "")
+    artist_score = lyric_similarity(metadata.get("artist", ""), artist_name or "") if metadata.get("artist") and artist_name else 0.0
+    expected = metadata.get("duration")
+    duration_score = 0.0 if not expected or not duration else max(0.0, 1.0 - abs(float(expected) - float(duration)) / max(10.0, float(expected)))
+    return {
+        "provider": provider, "title": title or track_name or "", "track_name": track_name or "",
+        "artist_name": artist_name or "", "duration": duration, "source_url": url, "url": url,
+        "lrc_text": lrc_text or "", "plain_text": plain_text or "",
+        "metadata_score": round(track_score * 0.62 + artist_score * 0.23 + duration_score * 0.15, 4),
+        **extra,
+    }
+
+
+def fetch_bilibili_subtitle_candidates(video_info, deadline=None):
+    video_info = video_info or {}
+    bvid, cid = video_info.get("bvid"), video_info.get("cid")
+    if not bvid or not cid:
+        return []
+    title = str(video_info.get("title") or "")
+    uploader = str(video_info.get("uploader") or video_info.get("channel") or "")
+    metadata = extract_song_metadata(title, uploader, video_info)
+    try:
+        raw, url = _fetch_public_text(
+            f"https://api.bilibili.com/x/player/v2?bvid={quote_plus(str(bvid))}&cid={quote_plus(str(cid))}",
+            PAGE_TIMEOUT, MAX_PAGE_BYTES, {"application/json", "text/json", "text/plain"}, deadline,
+        )
+        payload = json.loads(raw)
+    except (HTTPError, URLError, OSError, ValueError, UnicodeError):
+        return []
+    subtitles = (((payload.get("data") or {}).get("subtitle") or {}).get("subtitles") or [])
+    candidates = []
+    for item in subtitles:
+        label = str(item.get("lan_doc") or item.get("lan") or "")
+        sub_url = item.get("subtitle_url") or ""
+        if sub_url.startswith("//"):
+            sub_url = "https:" + sub_url
+        elif sub_url.startswith("/"):
+            sub_url = urljoin("https://www.bilibili.com", sub_url)
+        if not sub_url:
+            continue
+        try:
+            body, final_url = _fetch_public_text(sub_url, PAGE_TIMEOUT, MAX_PAGE_BYTES, {"application/json", "text/json", "text/plain"}, deadline)
+            entries = (json.loads(body).get("body") or [])
+        except (HTTPError, URLError, OSError, ValueError, UnicodeError):
+            continue
+        lrc_lines = []
+        plain_lines = []
+        for entry in entries:
+            text = str(entry.get("content") or entry.get("text") or "").strip()
+            if not text:
+                continue
+            start = float(entry.get("from", entry.get("start", 0)) or 0)
+            lrc_lines.append(f"[{int(start // 60):02d}:{start % 60:05.2f}]{text}")
+            plain_lines.append(text)
+        if not plain_lines:
+            continue
+        is_auto = bool(re.search(r"ai|自动|自動|机器|機器", f"{item.get('lan', '')} {label}", re.I))
+        is_chinese = bool(re.search(r"zh|中文|简体|繁体|漢語|汉语", f"{item.get('lan', '')} {label}", re.I))
+        quality = (2 if is_chinese else 0) + (1 if not is_auto else 0)
+        candidate_title = " ".join(part for part in (
+            metadata.get("artist"), metadata.get("song_title"), f"B站字幕：{label}",
+        ) if part)
+        candidates.append(_candidate_metadata(
+            metadata, str(metadata.get("song_title") or title), str(metadata.get("artist") or uploader), video_info.get("duration"),
+            final_url, candidate_title, "bilibili_subtitle", "\n".join(lrc_lines), "\n".join(plain_lines),
+            language=str(item.get("lan") or ""), is_automatic=is_auto, is_chinese=is_chinese, subtitle_label=label, subtitle_quality=quality,
+        ))
+    return sorted(candidates, key=lambda item: (item.get("subtitle_quality", 0), item.get("metadata_score", 0)), reverse=True)
+
+
+def fetch_netease_candidates(metadata, deadline=None):
+    if not _cfg("search.netease_enabled", bool) or not metadata.get("song_title"):
+        return []
+    query = " ".join(part for part in (metadata.get("artist"), metadata.get("song_title")) if part)
+    try:
+        search_url = "https://music.163.com/api/search/get/web?" + urlencode({"s": query, "type": 1, "offset": 0, "total": "true", "limit": 10})
+        raw, _ = _fetch_public_text(search_url, SEARCH_TIMEOUT, MAX_SEARCH_BYTES, {"application/json", "text/json", "text/plain"}, deadline)
+        songs = ((json.loads(raw).get("result") or {}).get("songs") or [])
+    except (HTTPError, URLError, OSError, ValueError, UnicodeError):
+        return []
+    candidates = []
+    for song in songs[:_cfg("search.netease_max_results", int)]:
+        artists = "/".join(str(a.get("name") or "") for a in (song.get("artists") or []) if a.get("name"))
+        duration = float(song.get("duration") or 0) / 1000
+        track = str(song.get("name") or "")
+        if lyric_similarity(metadata.get("song_title"), track) < 0.55:
+            continue
+        lyric_url = f"https://music.163.com/api/song/lyric?id={quote_plus(str(song.get('id')))}&lv=1&kv=1&tv=-1"
+        try:
+            lyric_raw, final_url = _fetch_public_text(lyric_url, PAGE_TIMEOUT, MAX_PAGE_BYTES, {"application/json", "text/json", "text/plain"}, deadline)
+            lyric_payload = json.loads(lyric_raw)
+        except (HTTPError, URLError, OSError, ValueError, UnicodeError):
+            continue
+        lrc = str(((lyric_payload.get("lrc") or {}).get("lyric")) or "")
+        plain = str(((lyric_payload.get("tlyric") or {}).get("lyric")) or "") or lrc
+        if lrc or plain:
+            candidates.append(_candidate_metadata(metadata, track, artists, duration, final_url, f"{track} - {artists}".strip(" -"), "netease", lrc, plain))
+    return candidates
+
+
 def fetch_lrclib_candidates(metadata, deadline=None):
     if not _cfg("search.lrclib_enabled", bool) or not metadata.get("song_title"):
         return []
@@ -1487,8 +1662,6 @@ def fetch_lrclib_candidates(metadata, deadline=None):
             if item_id not in seen_ids:
                 seen_ids.add(item_id)
                 payload.append(item)
-        if payload:
-            break
     candidates = []
     max_results = _cfg("search.lrclib_max_results", int)
 
@@ -1527,14 +1700,13 @@ def fetch_lrclib_candidates(metadata, deadline=None):
         plain = str(item.get("plainLyrics") or "").strip()
         if not synced and not plain:
             continue
-        candidates.append({
-            "url": f"https://lrclib.net/api/get/{item.get('id')}",
-            "title": f"{item.get('trackName') or ''} - {item.get('artistName') or ''}".strip(" -"),
-            "snippet": plain[:500],
-            "lrc_text": synced,
-            "plain_text": plain,
-            "duration": item.get("duration"),
-        })
+        url = f"https://lrclib.net/api/get/{item.get('id')}"
+        candidate = _candidate_metadata(
+            metadata, str(item.get("trackName") or ""), str(item.get("artistName") or ""), item.get("duration"), url,
+            f"{item.get('trackName') or ''} - {item.get('artistName') or ''}".strip(" -"), "lrclib", synced, plain,
+        )
+        candidate["snippet"] = plain[:500]
+        candidates.append(candidate)
     return candidates
 
 
@@ -1686,6 +1858,12 @@ def _empty_correction(search_query, reason, search_queries=None):
         "search_query": search_query,
         "search_queries": list(search_queries or ([search_query] if search_query else [])),
         "reason": reason,
+        "provider": None,
+        "confidence": 0.0,
+        "match_type": "fallback",
+        "metadata": {"song_title": "", "detected_artist": "", "source_artist": "", "language": "auto", "version": ""},
+        "timeline": {"model": None, "offset": None, "scale": 1.0, "rmse": None, "anchor_count": 0},
+        "attempted_providers": [],
     }
 
 
@@ -1696,11 +1874,17 @@ def _source_matches_subject(source_text, metadata, timeline_rank):
     if not song:
         return False
     strong_audio_match = (
-        timeline_rank[1] >= _cfg_number("candidate_filter.strong_audio_coverage")
+        timeline_rank[3] >= 2
+        and timeline_rank[3] * timeline_rank[4] >= 2
+        and timeline_rank[1] >= _cfg_number("candidate_filter.strong_audio_coverage")
         and timeline_rank[2] >= _cfg_number("candidate_filter.strong_audio_average_confidence")
         and timeline_rank[4] >= _cfg_number("candidate_filter.strong_audio_high_confidence_ratio")
     )
-    if song not in source_normalized and not strong_audio_match:
+    source_parts = [source_text] + re.split(r"[\s\-—–_|｜:：/]+", str(source_text or ""))
+    song_match = song in source_normalized or max(
+        (lyric_similarity(song, part) for part in source_parts), default=0.0
+    ) >= _cfg_number("candidate_filter.source_title_similarity_threshold")
+    if not song_match:
         return False
     return not artist or artist in source_normalized or strong_audio_match
 
@@ -1748,8 +1932,12 @@ def correct_segments_from_web(
     metadata = extract_song_metadata(title, uploader, video_info)
     search_queries = metadata["search_queries"]
     search_query = search_queries[0] if search_queries else ""
-    correction = _empty_correction(search_query, "未找到质量足够的网页歌词", search_queries)
+    correction = _empty_correction(search_query, "未找到质量足够的歌词候选", search_queries)
     correction["total_count"] = len(segments)
+    correction["metadata"].update({
+        "song_title": metadata.get("song_title", ""), "detected_artist": metadata.get("artist", ""),
+        "language": metadata.get("language", "auto"), "version": metadata.get("version", ""),
+    })
     if not segments:
         correction["reason"] = "没有可校正的识别分段"
         return segments, correction
@@ -1773,8 +1961,14 @@ def correct_segments_from_web(
         )
     )
 
-    def consider(lyric_lines, source_url, source_title, source_context=""):
+    def provider_quality(provider):
+        return _cfg_number(f"provider_quality.{provider if provider in _cfg('provider_quality', dict) else 'web'}")
+
+    def consider(lyric_lines, source_url, source_title, source_context="", candidate=None):
         nonlocal best_timeline, best_text
+        candidate = candidate or {}
+        quality = provider_quality(candidate.get("provider", "web"))
+        metadata_score = float(candidate.get("metadata_score") or 0.0)
         lyric_lines = _filter_candidate_title_lines(lyric_lines, source_title)
         if len(lyric_lines) < _cfg("candidate_filter.minimum_candidate_lines", int):
             return
@@ -1783,24 +1977,28 @@ def correct_segments_from_web(
             f"{source_title} {source_context}", metadata, timeline_rank,
         )
         acceptable = acceptable and source_consistent
-        if acceptable and (best_timeline is None or timeline_rank > best_timeline[0]):
-            best_timeline = (timeline_rank, timed, source_url, source_title)
+        weighted_timeline_rank = (timeline_rank[0], timeline_rank[1], timeline_rank[2], timeline_rank[3], timeline_rank[4], quality, metadata_score)
+        if acceptable and (best_timeline is None or weighted_timeline_rank > best_timeline[0]):
+            best_timeline = (weighted_timeline_rank, timed, source_url, source_title, candidate)
         aligned = align_lyrics_to_segments(segments, lyric_lines)
         matched = sum(1 for item in aligned if item["corrected"])
         confidence_sum = sum(item["confidence"] for item in aligned if item["corrected"])
         average_text_confidence = confidence_sum / max(1, matched)
-        text_rank = (matched, confidence_sum)
+        text_rank = (matched, confidence_sum, quality, metadata_score)
         text_consistent = source_consistent or (
             matched >= _cfg("candidate_filter.text_consistency_min_matches", int)
             and average_text_confidence >= _cfg_number("candidate_filter.text_consistency_average_confidence")
         )
         if text_consistent and (best_text is None or text_rank > best_text[0]):
-            best_text = (text_rank, aligned, source_url, source_title)
+            best_text = (text_rank, aligned, source_url, source_title, candidate)
 
     def evaluate_candidates(candidates):
         nonlocal best_lrc
         combined_snippet_lines = []
         for candidate in candidates:
+            provider = candidate.get("provider", "web")
+            if provider not in correction["attempted_providers"]:
+                correction["attempted_providers"].append(provider)
             cancel_check()
             if deadline is not None and _remaining(deadline) <= 0:
                 raise TimeoutError("歌词联网校正超出请求预算")
@@ -1820,31 +2018,30 @@ def correct_segments_from_web(
                 source_consistent = _source_matches_subject(
                     f"{candidate['title']} {candidate.get('snippet', '')}",
                     metadata,
-                    (len(lrc_timed), 0.0, lrc_details.get("average_confidence", 0.0),
-                     lrc_details.get("anchor_count", 0), lrc_details.get("average_confidence", 0.0)),
+                    (len(lrc_timed), 1.0, lrc_details.get("average_confidence", 0.0),
+                     lrc_details.get("anchor_count", 0), lrc_details.get("high_confidence_ratio", 0.0)),
                 )
                 lrc_details["accepted"] = bool(lrc_details.get("accepted") and source_consistent and lrc_timed)
                 if lrc_details["accepted"]:
                     lrc_rank = (
-                        lrc_details.get("anchor_count", 0),
-                        lrc_details.get("average_confidence", 0.0),
-                        -lrc_details.get("offset_spread", 999.0),
-                        len(lrc_timed),
+                        lrc_details.get("anchor_count", 0), lrc_details.get("average_confidence", 0.0),
+                        -lrc_details.get("offset_spread", 999.0), len(lrc_timed),
+                        provider_quality(candidate.get("provider", "web")), float(candidate.get("metadata_score") or 0.0),
                     )
                     if best_lrc is None or lrc_rank > best_lrc[0]:
-                        best_lrc = (lrc_rank, lrc_timed, final_url, candidate["title"])
+                        best_lrc = (lrc_rank, lrc_timed, final_url, candidate["title"], candidate, lrc_details)
                 page_lines = extract_lyrics_from_page(page, reference_text)
                 consider(
                     page_lines if len(page_lines) >= _cfg("candidate_filter.page_lines_preferred_minimum", int) else snippet_lines,
                     final_url,
                     candidate["title"],
-                    candidate.get("snippet", ""),
+                    candidate.get("snippet", ""), candidate,
                 )
             except TimeoutError:
                 raise
             except (HTTPError, URLError, OSError, ValueError, UnicodeError) as exc:
                 logger.warning("歌词候选处理失败 url=%s error=%s", candidate.get("url"), exc)
-                consider(snippet_lines, candidate["url"], candidate["title"], candidate.get("snippet", ""))
+                consider(snippet_lines, candidate["url"], candidate["title"], candidate.get("snippet", ""), candidate)
 
         if len(combined_snippet_lines) >= _cfg("candidate_filter.combined_snippet_minimum", int) and candidates:
             consider(
@@ -1855,7 +2052,11 @@ def correct_segments_from_web(
             )
 
     cancel_check()
-    evaluate_candidates(fetch_lrclib_candidates(metadata, deadline))
+    structured_candidates = []
+    structured_candidates.extend(fetch_bilibili_subtitle_candidates(video_info or {}, deadline))
+    structured_candidates.extend(fetch_netease_candidates(metadata, deadline))
+    structured_candidates.extend(fetch_lrclib_candidates(metadata, deadline))
+    evaluate_candidates(structured_candidates)
     cancel_check()
     has_reliable_result = (
         best_lrc is not None
@@ -1869,6 +2070,29 @@ def correct_segments_from_web(
         evaluate_candidates(search_lyrics_candidates(search_queries, deadline))
     cancel_check()
 
+    def selection_fields(candidate, timeline=None, confidence=0.0):
+        candidate = candidate or {}
+        source_artist = str(candidate.get("artist_name") or "")
+        detected_artist = str(metadata.get("artist") or "")
+        same_artist = not detected_artist or not source_artist or lyric_similarity(detected_artist, source_artist) >= _cfg_number("candidate_filter.artist_match_threshold")
+        if metadata.get("is_live"):
+            match_type = "live"
+        elif metadata.get("is_cover") or not same_artist:
+            match_type = "cover"
+        elif metadata.get("version"):
+            match_type = "version"
+        else:
+            match_type = "exact"
+        return {
+            "provider": candidate.get("provider", "web"), "confidence": round(float(confidence), 4), "match_type": match_type,
+            "metadata": {**correction["metadata"], "source_artist": source_artist},
+            "timeline": {
+                "model": (timeline or {}).get("timeline_model"), "offset": (timeline or {}).get("offset"),
+                "scale": (timeline or {}).get("scale", 1.0), "rmse": (timeline or {}).get("rmse"),
+                "anchor_count": (timeline or {}).get("anchor_count", 0),
+            },
+        }
+
     if best_lrc is not None:
         timed_count = len(best_lrc[1])
         correction.update({
@@ -1879,7 +2103,8 @@ def correct_segments_from_web(
             "total_count": timed_count,
             "source_url": best_lrc[2],
             "source_title": best_lrc[3],
-            "reason": f"已同步网页 LRC，共 {timed_count} 行",
+            "reason": f"已同步歌词时间轴，共 {timed_count} 行",
+            **selection_fields(best_lrc[4], best_lrc[5], best_lrc[5].get("average_confidence", 0.0)),
         })
         return best_lrc[1], correction
 
@@ -1893,7 +2118,8 @@ def correct_segments_from_web(
             "total_count": timed_count,
             "source_url": best_timeline[2],
             "source_title": best_timeline[3],
-            "reason": f"已根据网页歌词重建 {timed_count} 行时间轴",
+            "reason": f"已根据歌词重建 {timed_count} 行时间轴",
+            **selection_fields(best_timeline[4], confidence=best_timeline[0][2]),
         })
         return best_timeline[1], correction
 
@@ -1906,7 +2132,8 @@ def correct_segments_from_web(
             "matched_count": matched_count,
             "source_url": best_text[2],
             "source_title": best_text[3],
-            "reason": f"已按网页歌词校正 {matched_count}/{len(segments)} 句",
+            "reason": f"已按歌词校正 {matched_count}/{len(segments)} 句",
+            **selection_fields(best_text[4], confidence=best_text[0][1] / max(1, matched_count)),
         })
         return best_text[1], correction
 
