@@ -31,6 +31,34 @@ MODEL_TRANSCRIBE_PARAMS = {
 }
 
 
+_LANGUAGE_METADATA_FIELDS = (
+    "title", "page_title", "total_title", "original_title", "description", "dynamic",
+)
+_ENGLISH_NOISE_WORDS = {
+    "4k", "8k", "hd", "uhd", "mv", "pv", "live", "official", "video", "audio", "cover",
+}
+
+
+def infer_metadata_language(video_info):
+    texts = [str(video_info.get(field) or "") for field in _LANGUAGE_METADATA_FIELDS]
+    for field in ("tags", "categories"):
+        texts.extend(str(item) for item in (video_info.get(field) or []) if item)
+    text = "\n".join(texts)
+    if re.search(r"[\u3040-\u30ff\u31f0-\u31ff]", text):
+        return "ja"
+    if re.search(r"[\uac00-\ud7a3]", text):
+        return "ko"
+    if len(re.findall(r"[\u3400-\u4dbf\u4e00-\u9fff]", text)) >= 2:
+        return "zh"
+    english_words = [
+        word for word in re.findall(r"[A-Za-z]+(?:'[A-Za-z]+)?", text)
+        if word.lower() not in _ENGLISH_NOISE_WORDS
+    ]
+    if sum(len(word) for word in english_words) >= 4:
+        return "en"
+    return "auto"
+
+
 def parse_bilibili_video_url(url):
     parsed = urlparse(url)
     hostname = (parsed.hostname or "").lower()
@@ -79,10 +107,29 @@ def resolve_bilibili_audio(url, timeout):
     if not audio_url or urlparse(audio_url).scheme not in {"http", "https"}:
         raise ValueError("Bilibili API 返回了无效音频地址")
     uploader = str((video.get("owner") or {}).get("name") or "")
+    total_title = str(video.get("title") or "")
+    page_title = str(page.get("part") or "")
+    page_duration = page.get("duration")
+    total_duration = video.get("duration")
     return {
         "audio_url": audio_url, "headers": BILIBILI_HEADERS,
-        "video_info": {"id": bvid, "title": str(video.get("title") or page.get("part") or ""),
-                       "uploader": uploader, "channel": uploader},
+        "video_info": {
+            "id": bvid,
+            "title": page_title or total_title,
+            "page_title": page_title,
+            "page_number": page_number,
+            "page_count": len(pages),
+            "original_title": total_title,
+            "total_title": total_title,
+            "duration": page_duration if page_duration is not None else total_duration,
+            "page_duration": page_duration,
+            "total_duration": total_duration,
+            "description": str(video.get("desc") or ""),
+            "dynamic": str(video.get("dynamic") or ""),
+            "categories": [str(video.get("tname"))] if video.get("tname") else [],
+            "tags": [tag.get("tag_name") for tag in (video.get("tag") or []) if isinstance(tag, dict) and tag.get("tag_name")],
+            "uploader": uploader, "channel": uploader,
+        },
     }
 
 
@@ -172,6 +219,7 @@ def transcribe_request(
                     downloaded = candidates[0]
                 if downloaded.stat().st_size > settings.max_download_bytes:
                     raise HTTPException(status_code=413, detail="下载文件超过大小上限")
+            metadata_language = infer_metadata_language(video_info)
             video_title = str(video_info.get("title") or "")
             uploader = str(video_info.get("uploader") or video_info.get("channel") or "")
             song_metadata = extract_song_metadata(video_title, uploader, video_info)
@@ -203,7 +251,10 @@ def transcribe_request(
 
             stage_callback("whisper")
             check_cancel()
-            language = None if request.language in {"", "auto"} else request.language
+            requested_language = request.language or "auto"
+            language = None if requested_language == "auto" else requested_language
+            if language is None and metadata_language != "auto":
+                language = metadata_language
             whisper_segments, whisper_info = run_model_transcription(
                 wav_path, language, vad_filter, cancel_event, deadline,
             )

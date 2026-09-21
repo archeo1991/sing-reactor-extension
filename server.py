@@ -475,7 +475,15 @@ def _explicit_song_from_metadata(video_info):
     info = video_info or {}
     if info.get("track"):
         return _compact_title_part(info["track"])
+    for key in ("total_title", "original_title", "page_title"):
+        value = str(info.get(key) or "")
+        book_match = BOOK_TITLE_RE.search(value)
+        if book_match:
+            return _compact_title_part(book_match.group(1))
     for value in _metadata_text_values(info):
+        book_match = BOOK_TITLE_RE.search(value)
+        if book_match:
+            return _compact_title_part(book_match.group(1))
         for pattern in DISCOVERY_TITLE_RES:
             match = pattern.search(value)
             if match:
@@ -555,6 +563,17 @@ def _extract_artist_and_song(title, uploader="", video_info=None):
     if not artist:
         explicit_artists = [str((video_info or {}).get(key) or "") for key in ("artist", "album_artist", "creator")]
         artist = next((value for value in explicit_artists if value), "")
+    if not artist:
+        info = video_info or {}
+        alternate_info = {key: value for key, value in info.items()
+                          if key not in {"page_title", "total_title", "original_title"}}
+        for key in ("total_title", "original_title", "page_title"):
+            alternate_title = str(info.get(key) or "")
+            if alternate_title and alternate_title != original:
+                alternate_artist, _ = _extract_artist_and_song(alternate_title, uploader, alternate_info)
+                if alternate_artist:
+                    artist = alternate_artist
+                    break
     if not artist:
         artist = _trusted_uploader_artist(uploader, original, [])
     if artist and normalize_lyric_text(artist) == normalize_lyric_text(song):
@@ -1481,19 +1500,29 @@ def fetch_lrclib_candidates(metadata, deadline=None):
             return None
 
     expected_duration = safe_duration(metadata.get("duration"))
+    expected_track = str(metadata.get("song_title") or "")
+    expected_artist = str(metadata.get("artist") or "")
 
-    def duration_rank(item):
+    def duration_distance(item):
         duration = safe_duration(item.get("duration"))
-        return (
-            duration is None,
-            abs(duration - expected_duration) if expected_duration is not None and duration is not None else 0,
-        )
+        return abs(duration - expected_duration) if expected_duration is not None and duration is not None else float("inf")
 
-    ranked_payload = sorted(
-        (item for item in payload if isinstance(item, dict)),
-        key=duration_rank,
-    )
-    for item in ranked_payload[:max_results]:
+    def metadata_rank(item):
+        track_similarity = lyric_similarity(expected_track, item.get("trackName", ""))
+        artist_value = str(item.get("artistName") or "")
+        artist_similarity = lyric_similarity(expected_artist, artist_value) if expected_artist and artist_value else 0.0
+        return track_similarity, artist_similarity, duration_distance(item)
+
+    ranked_payload = []
+    for item in payload:
+        if not isinstance(item, dict):
+            continue
+        track_similarity, artist_similarity, _ = metadata_rank(item)
+        if track_similarity < 0.55 or (expected_artist and artist_similarity < 0.45 and track_similarity < 0.82):
+            continue
+        ranked_payload.append((item, track_similarity, artist_similarity))
+    ranked_payload.sort(key=lambda row: (-row[1], -row[2], duration_distance(row[0])))
+    for item, track_similarity, artist_similarity in ranked_payload[:max_results]:
         synced = str(item.get("syncedLyrics") or "").strip()
         plain = str(item.get("plainLyrics") or "").strip()
         if not synced and not plain:

@@ -9,7 +9,8 @@ from unittest import mock
 from cache import ResultCache
 from job_manager import JobCancelled, JobManager, JobQueueFull
 from models import TranscribeRequest
-from transcribe_service import parse_bilibili_video_url, resolve_bilibili_audio
+from transcribe_service import infer_metadata_language, parse_bilibili_video_url, resolve_bilibili_audio, transcribe_request
+from server import extract_song_metadata, fetch_lrclib_candidates
 
 
 class JobManagerTests(unittest.TestCase):
@@ -132,7 +133,20 @@ class BilibiliResolverTests(unittest.TestCase):
         self.assertIsNone(parse_bilibili_video_url("https://example.com/video/BV1sc411V7ZE"))
 
     def test_resolve_uses_selected_page_and_best_audio(self):
-        video = {"code": 0, "data": {"title": "Song", "owner": {"name": "Singer"}, "pages": [{"page": 2, "cid": 22}]}}
+        video = {
+            "code": 0,
+            "data": {
+                "title": "【4K修复】青鸟飞鱼《此生不换》",
+                "desc": "歌曲：此生不换\n歌手：青鸟飞鱼",
+                "duration": 500,
+                "tname": "音乐综合",
+                "owner": {"name": "Uploader"},
+                "pages": [
+                    {"page": 1, "cid": 11, "part": "其他", "duration": 233},
+                    {"page": 2, "cid": 22, "part": "此生不换 4k 上传", "duration": 267},
+                ],
+            },
+        }
         play = {"code": 0, "data": {"dash": {"audio": [{"bandwidth": 1, "baseUrl": "https://cdn/low"}, {"bandwidth": 2, "base_url": "https://cdn/high"}]}}}
         def response(payload):
             value = mock.MagicMock()
@@ -140,9 +154,110 @@ class BilibiliResolverTests(unittest.TestCase):
             return value
         with mock.patch("transcribe_service.urlopen", side_effect=[response(video), response(play)]) as opened:
             result = resolve_bilibili_audio("https://www.bilibili.com/video/BV1sc411V7ZE?p=2", 10)
+        info = result["video_info"]
         self.assertEqual(result["audio_url"], "https://cdn/high")
-        self.assertEqual(result["video_info"]["title"], "Song")
+        self.assertEqual(info["title"], "此生不换 4k 上传")
+        self.assertEqual(info["total_title"], "【4K修复】青鸟飞鱼《此生不换》")
+        self.assertEqual(info["duration"], 267)
+        self.assertEqual(info["total_duration"], 500)
+        self.assertIn("歌曲：此生不换", info["description"])
+        self.assertEqual(info["categories"], ["音乐综合"])
         self.assertIn("cid=22", opened.call_args_list[1].args[0].full_url)
+
+    def test_bv1my411w7ai_metadata_uses_page_and_total_title(self):
+        info = {
+            "title": "此生不换 4k 上传",
+            "page_title": "此生不换 4k 上传",
+            "total_title": "【4K修复】青鸟飞鱼《此生不换》经典歌曲",
+            "original_title": "【4K修复】青鸟飞鱼《此生不换》经典歌曲",
+            "duration": 267,
+            "description": "歌曲：此生不换\n演唱：青鸟飞鱼",
+            "uploader": "影视音乐收藏",
+        }
+        metadata = extract_song_metadata(info["title"], info["uploader"], info)
+        self.assertEqual(metadata["song_title"], "此生不换")
+        self.assertEqual(metadata["artist"], "青鸟飞鱼")
+        self.assertEqual(metadata["duration"], 267)
+        self.assertEqual(infer_metadata_language(info), "zh")
+
+    def test_metadata_language_falls_back_to_auto_for_noise_only(self):
+        info = {"title": "4K MV", "description": "", "tags": ["HD"]}
+        self.assertEqual(infer_metadata_language(info), "auto")
+
+    def test_metadata_language_detects_obvious_japanese_korean_and_english(self):
+        self.assertEqual(infer_metadata_language({"title": "君の知らない物語"}), "ja")
+        self.assertEqual(infer_metadata_language({"title": "사랑 노래"}), "ko")
+        self.assertEqual(infer_metadata_language({"title": "A Beautiful Song"}), "en")
+
+
+class TranscribeRequestTests(unittest.TestCase):
+    def test_metadata_language_applies_only_to_auto_request(self):
+        settings = mock.Mock(
+            request_timeout=60, model_name="tiny", device="cpu", compute_type="int8",
+            ytdlp_socket_timeout=10, max_download_bytes=1024, ffmpeg_timeout=10,
+        )
+        cache = mock.Mock()
+        cache.get.return_value = None
+        run_model = mock.Mock(return_value=([], mock.Mock(language="zh")))
+        dependencies = {
+            "settings": settings,
+            "vad_filter": False,
+            "cache": cache,
+            "lyrics_config": {},
+            "get_model": mock.Mock(),
+            "run_command": mock.Mock(),
+            "run_model_transcription": run_model,
+            "bounded_timeout": lambda _deadline, timeout: timeout,
+            "remaining": lambda _deadline: 60,
+            "extract_song_metadata": mock.Mock(return_value={"search_queries": []}),
+            "empty_correction": mock.Mock(return_value={}),
+            "correct_segments_from_web": mock.Mock(),
+            "interpolate_words_from_segments": mock.Mock(return_value=[]),
+            "lyrics_web_correction": False,
+        }
+        bilibili_source = {
+            "audio_url": "https://cdn.example/audio.m4s",
+            "headers": {},
+            "video_info": {"title": "此生不换", "uploader": "青鸟飞鱼"},
+        }
+
+        with mock.patch("transcribe_service.resolve_bilibili_audio", return_value=bilibili_source):
+            transcribe_request(
+                TranscribeRequest(url="https://www.bilibili.com/video/BV1abc", start=0, end=10, language="auto"),
+                **dependencies,
+            )
+            transcribe_request(
+                TranscribeRequest(url="https://www.bilibili.com/video/BV1abc", start=0, end=10, language="en"),
+                **dependencies,
+            )
+
+        self.assertEqual(run_model.call_args_list[0].args[1], "zh")
+        self.assertEqual(run_model.call_args_list[1].args[1], "en")
+
+
+class LrclibCandidateTests(unittest.TestCase):
+    @staticmethod
+    def response(items):
+        return json.dumps(items), "https://lrclib.net/api/search"
+
+    def test_metadata_similarity_precedes_duration_and_filters_wrong_track(self):
+        items = [
+            {"id": 1, "trackName": "错误歌曲", "artistName": "青鸟飞鱼", "duration": 267, "plainLyrics": "wrong"},
+            {"id": 2, "trackName": "此生不换", "artistName": "青鸟飞鱼", "duration": 280, "plainLyrics": "right artist"},
+            {"id": 3, "trackName": "此生不换", "artistName": "其他歌手", "duration": 267, "plainLyrics": "wrong artist"},
+        ]
+        with mock.patch("server._fetch_public_text", return_value=self.response(items)):
+            candidates = fetch_lrclib_candidates({"song_title": "此生不换", "artist": "青鸟飞鱼", "duration": 267})
+        self.assertEqual([item["url"].rsplit("/", 1)[-1] for item in candidates], ["2", "3"])
+
+    def test_missing_artist_allows_strong_track_match(self):
+        items = [
+            {"id": 4, "trackName": "此生不换", "artistName": "", "duration": 270, "plainLyrics": "lyrics"},
+            {"id": 5, "trackName": "完全不同", "artistName": "", "duration": 267, "plainLyrics": "wrong"},
+        ]
+        with mock.patch("server._fetch_public_text", return_value=self.response(items)):
+            candidates = fetch_lrclib_candidates({"song_title": "此生不换", "artist": "", "duration": 267})
+        self.assertEqual([item["url"].rsplit("/", 1)[-1] for item in candidates], ["4"])
 
 
 class ServerAuthTests(unittest.TestCase):

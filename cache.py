@@ -8,7 +8,7 @@ from pathlib import Path
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 
-CACHE_VERSION = 1
+CACHE_VERSION = 3
 
 
 class ResultCache:
