@@ -25,9 +25,16 @@
 sing reactor extension/
 ├─ browser-extension/     Chrome / Edge 扩展源码
 ├─ server.py              FastAPI 识别服务
+├─ transcribe_service.py  B站音频下载、ffmpeg 切片与 Faster-Whisper 识别
 ├─ app_config.py          服务端环境配置
+├─ cache.py               识别结果缓存
+├─ job_manager.py         异步识别任务队列
+├─ models.py              请求与响应数据模型
 ├─ requirements.txt       服务端 Python 依赖
 ├─ lyrics_config.json     歌词搜索、筛选和同步配置
+├─ test_core.py           核心单元测试
+├─ LYRICS_PIPELINE.md     歌词流水线设计说明
+├─ deploy/                systemd 与 Nginx 部署模板
 ├─ INSTALL.md             普通用户安装说明
 ├─ SERVER_DEPLOY.md       服务维护者部署说明
 └─ build-release.ps1      扩展发布包生成脚本
@@ -62,8 +69,8 @@ sing reactor extension/
 
 1. 安装 Python 3.10+、FFmpeg 和 `requirements.txt` 中的依赖。
 2. 使用 `python server.py` 启动开发服务，默认监听 `127.0.0.1:8765`。
-3. 使用可访问的 HTTPS 测试地址打包扩展，或按开发环境调整 `browser-extension/config.js` 与清单权限。
-4. 在 `chrome://extensions` 中加载 `browser-extension/`。
+3. `browser-extension/config.js` 默认连接 `http://127.0.0.1:8765`，可直接加载调试；需要指向其他服务时用 `.\build-release.ps1 -ApiBase "..." -AllowLocalHttp` 生成扩展包。
+4. 在 `chrome://extensions` 中加载 `browser-extension/` 或生成的扩展目录。
 
 服务端健康检查为 `/health`。生产环境应使用 HTTPS 反向代理，并限制允许访问的扩展来源。
 

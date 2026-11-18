@@ -156,6 +156,7 @@ globalThis.BLSBackgroundLogic = Object.freeze({
 });
 
 async function localApi(path, options = {}) {
+  shared.requireApiBase();
   let token;
   let usesConfiguredToken = false;
   try {
@@ -229,6 +230,6 @@ function cancelTranscribeJob(jobId) {
 
 function friendlyError(error) {
   const message = error instanceof Error ? error.message : String(error || '未知错误');
-  if (/Failed to fetch|NetworkError|fetch/i.test(message)) return `网络请求失败：${message}`;
+  if (/Failed to fetch|NetworkError|Load failed|net::ERR_/i.test(message)) return `网络请求失败：${message}`;
   return message;
 }

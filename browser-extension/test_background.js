@@ -88,6 +88,15 @@ vm.runInContext(fs.readFileSync('browser-extension/background.js', 'utf8'), cont
   assert.strictEqual(logic.shouldRetryJobOperation({ ok: false }, 5, 5), false);
   assert.strictEqual(logic.shouldRetryJobOperation({ ok: true }, 1, 5), false);
 
+  const protocolSource = fs.readFileSync('browser-extension/protocol.js', 'utf8');
+  const emptyConfigContext = { BLSConfig: { API_BASE: '' } };
+  emptyConfigContext.globalThis = emptyConfigContext;
+  vm.createContext(emptyConfigContext);
+  vm.runInContext(protocolSource, emptyConfigContext);
+  assert.strictEqual(emptyConfigContext.BLSShared.API_BASE, '');
+  assert.strictEqual(emptyConfigContext.BLSShared.MAX_RANGE_SECONDS, 900);
+  assert.throws(() => emptyConfigContext.BLSShared.requireApiBase(), /API_BASE/);
+
   const contentSource = fs.readFileSync('browser-extension/content.js', 'utf8');
   const parseTimeSource = contentSource.match(/function parseTime\(raw, allowFraction = true\) \{[\s\S]*?\n  \}/)?.[0];
   assert.ok(parseTimeSource, 'parseTime function should exist');
@@ -98,6 +107,17 @@ vm.runInContext(fs.readFileSync('browser-extension/background.js', 'utf8'), cont
   assert.strictEqual(parseContext.parseTime('01:02', false), 62);
   assert.strictEqual(parseContext.parseTime('01:02.5', false), null);
   assert.strictEqual(parseContext.parseTime('01:60'), null);
+
+  const durationSource = contentSource.match(/function firstFinitePositive\(values\) \{[\s\S]*?\n  \}/)?.[0];
+  assert.ok(durationSource, 'firstFinitePositive function should exist');
+  const durationContext = {};
+  vm.createContext(durationContext);
+  vm.runInContext(`${durationSource}; this.firstFinitePositive = firstFinitePositive;`, durationContext);
+  assert.strictEqual(durationContext.firstFinitePositive([NaN, Infinity, undefined, null, 234]), 234);
+  assert.strictEqual(durationContext.firstFinitePositive([0, -5, 'abc']), 0);
+  assert.ok(/DURATION_EVENTS = \['loadedmetadata', 'loadeddata', 'canplay', 'durationchange'\]/.test(contentSource));
+  assert.ok(/\.bpx-player-ctrl-time-duration/.test(contentSource));
+
   assert.ok(!/row\.innerHTML/.test(contentSource));
   assert.ok(/textEl\.textContent = line\.text/.test(contentSource));
 

@@ -91,7 +91,7 @@ class ResultCache:
                 self._memory.move_to_end(key)
                 try:
                     self._write_entry(path, cached)
-                except OSError:
+                except (OSError, TypeError, ValueError):
                     pass
                 return cached["value"]
             if cached:
@@ -115,7 +115,10 @@ class ResultCache:
         now = time.time()
         entry = {"version": CACHE_VERSION, "created_at": now, "accessed_at": now, "value": value}
         path = self._path(key)
-        self._write_entry(path, entry)
+        try:
+            self._write_entry(path, entry)
+        except (OSError, TypeError, ValueError):
+            pass
         with self._lock:
             self._memory[key] = entry
             self._trim_locked()

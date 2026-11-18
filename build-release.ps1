@@ -53,7 +53,7 @@ $packageName = "sing-reactor-extension-$version"
 if ($PackageSuffix) {
     $packageName += "-$PackageSuffix"
 }
-$distRoot = Join-Path $scriptRoot $OutputDir
+$distRoot = if ([System.IO.Path]::IsPathRooted($OutputDir)) { $OutputDir } else { Join-Path $scriptRoot $OutputDir }
 $extensionRoot = Join-Path $distRoot $packageName
 $extensionZip = Join-Path $distRoot "$packageName.zip"
 

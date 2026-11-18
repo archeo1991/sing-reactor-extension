@@ -20,6 +20,8 @@ pip install -r requirements.txt
 
 首次识别时 Faster-Whisper 会下载所配置的模型，请预留磁盘空间。
 
+Windows 上也可以直接运行 `.\start-server.ps1`：脚本会复用或创建 `.venv`、安装依赖、预下载 `faster-whisper-small` 模型并启动服务。
+
 ## 配置环境变量
 
 PowerShell 示例：
@@ -34,6 +36,7 @@ $env:WHISPER_MODEL="small"
 
 - `SING_REACTOR_EXTENSION_ORIGINS` 支持逗号分隔多个扩展来源。生产环境应填写实际扩展 ID。
 - `SING_REACTOR_TOKEN` 应使用随机高强度密钥，并通过服务器环境变量管理。
+- `LYRICS_CONFIG_PATH` 可指向自定义歌词配置；文件必须使用 `schema_version` 1，并包含 `lyrics_config.json` 的全部字段（包括 `title_cleanup.contextual_terms`）。
 - 未配置允许来源时，开发模式会接受 Chrome / Firefox 扩展来源；生产环境不要依赖该回退行为。
 
 ## 启动服务
@@ -55,6 +58,8 @@ uvicorn server:app --host 0.0.0.0 --port 8765
 ```text
 http://127.0.0.1:8765/health
 ```
+
+注意：`SING_REACTOR_HOST` / `SING_REACTOR_PORT` 只影响 `python server.py`。使用下面的 `uvicorn` 命令或 `deploy/singreactor.service` 时，监听地址由命令行参数决定，修改端口需要同时更新对应文件与 Nginx 配置。
 
 ## 生产发布
 

@@ -78,6 +78,8 @@ def _get_bilibili_json(endpoint, params, timeout):
     request = Request(f"{endpoint}?{urlencode(params)}", headers=BILIBILI_HEADERS)
     with urlopen(request, timeout=timeout) as response:
         payload = json.loads(response.read().decode("utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError("Bilibili API 返回了无效响应")
     if payload.get("code") != 0:
         raise ValueError(f"Bilibili API 返回错误: {payload.get('message') or payload.get('code')}")
     return payload.get("data") or {}
@@ -90,6 +92,8 @@ def resolve_bilibili_audio(url, timeout):
     bvid, page_number = parsed
     video = _get_bilibili_json("https://api.bilibili.com/x/web-interface/view", {"bvid": bvid}, timeout)
     pages = video.get("pages") or []
+    if not isinstance(pages, list):
+        pages = []
     page = next((item for item in pages if item.get("page") == page_number), None)
     if page is None and page_number <= len(pages):
         page = pages[page_number - 1]
@@ -100,6 +104,8 @@ def resolve_bilibili_audio(url, timeout):
         {"bvid": bvid, "cid": page["cid"], "fnval": 16, "qn": 80, "fourk": 1}, timeout,
     )
     streams = (playback.get("dash") or {}).get("audio") or []
+    if not isinstance(streams, list):
+        streams = []
     if not streams:
         raise ValueError("Bilibili API 未返回可用音频流")
     stream = max(streams, key=lambda item: int(item.get("bandwidth") or 0))
@@ -196,31 +202,36 @@ def transcribe_request(
             )
             downloaded = None
             downloaded_info = {}
+            options = {
+                "format": "bestaudio/best", "outtmpl": output_template, "noplaylist": True,
+                "quiet": True, "no_warnings": True,
+                "socket_timeout": bounded_timeout(deadline, settings.ytdlp_socket_timeout),
+                "retries": settings.ytdlp_retries, "fragment_retries": settings.ytdlp_retries,
+                "extractor_retries": settings.ytdlp_retries, "file_access_retries": settings.ytdlp_retries,
+                "max_filesize": settings.max_download_bytes, "progress_hooks": [check_download],
+            }
             if bilibili_source:
                 video_info = bilibili_source["video_info"]
+                options["http_headers"] = bilibili_source["headers"]
+                download_url = bilibili_source["audio_url"]
             else:
-                options = {
-                    "format": "bestaudio/best", "outtmpl": output_template, "noplaylist": True,
-                    "quiet": True, "no_warnings": True,
-                    "socket_timeout": bounded_timeout(deadline, settings.ytdlp_socket_timeout),
-                    "retries": settings.ytdlp_retries, "fragment_retries": settings.ytdlp_retries,
-                    "extractor_retries": settings.ytdlp_retries, "file_access_retries": settings.ytdlp_retries,
-                    "max_filesize": settings.max_download_bytes, "progress_hooks": [check_download],
-                    "download_ranges": lambda _info, _ydl: [{"start_time": request.start, "end_time": request.end}],
-                }
-                with YoutubeDL(options) as downloader:
-                    video_info = downloader.extract_info(request.url, download=True)
-                    check_cancel()
-                    requested_downloads = video_info.get("requested_downloads") or []
-                    downloaded_info = requested_downloads[0] if requested_downloads else video_info
-                    downloaded = Path(downloaded_info.get("filepath") or downloader.prepare_filename(downloaded_info))
-                if not downloaded.exists():
-                    candidates = list(temp_path.glob("source.*"))
-                    if not candidates:
-                        raise HTTPException(status_code=500, detail="yt-dlp 未生成音频文件")
-                    downloaded = candidates[0]
-                if downloaded.stat().st_size > settings.max_download_bytes:
-                    raise HTTPException(status_code=413, detail="下载文件超过大小上限")
+                options["download_ranges"] = lambda _info, _ydl: [{"start_time": request.start, "end_time": request.end}]
+                download_url = request.url
+            with YoutubeDL(options) as downloader:
+                download_info = downloader.extract_info(download_url, download=True)
+                check_cancel()
+                requested_downloads = download_info.get("requested_downloads") or []
+                downloaded_info = requested_downloads[0] if requested_downloads else download_info
+                downloaded = Path(downloaded_info.get("filepath") or downloader.prepare_filename(downloaded_info))
+                if not bilibili_source:
+                    video_info = download_info
+            if not downloaded.exists():
+                candidates = list(temp_path.glob("source.*"))
+                if not candidates:
+                    raise HTTPException(status_code=500, detail="yt-dlp 未生成音频文件")
+                downloaded = candidates[0]
+            if downloaded.stat().st_size > settings.max_download_bytes:
+                raise HTTPException(status_code=413, detail="下载文件超过大小上限")
             metadata_language = str(video_info.get("metadata_language") or infer_metadata_language(video_info))
             video_info = dict(video_info)
             video_info["metadata_language"] = metadata_language
@@ -232,17 +243,11 @@ def transcribe_request(
             check_cancel()
             stage_callback("ffmpeg")
             wav_path = temp_path / "clip.wav"
-            if bilibili_source:
-                headers = "".join(f"{key}: {value}\r\n" for key, value in bilibili_source["headers"].items())
-                ffmpeg_input = ["-ss", str(request.start), "-headers", headers, "-reconnect", "1",
-                                "-reconnect_streamed", "1", "-reconnect_delay_max", "5",
-                                "-i", bilibili_source["audio_url"]]
-            else:
-                section_start = downloaded_info.get("section_start")
-                local_start = 0.0 if section_start is not None else request.start
-                ffmpeg_input = ["-ss", str(local_start), "-i", str(downloaded)]
+            section_start = downloaded_info.get("section_start")
+            local_start = 0.0 if section_start is not None else request.start
+            ffmpeg_input = ["-ss", str(local_start), "-i", str(downloaded)]
             run_command(
-                ["ffmpeg", "-y", *ffmpeg_input, "-t", str(duration),
+                ["ffmpeg", "-y", "-nostdin", "-loglevel", "error", *ffmpeg_input, "-t", str(duration),
                  "-vn", "-ac", "1", "-ar", "16000", str(wav_path)],
                 "音频截取失败",
                 bounded_timeout(deadline, settings.ffmpeg_timeout),

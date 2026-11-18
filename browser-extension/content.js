@@ -7,6 +7,10 @@
   const P = 'bls-';
   const shared = window.BLSShared;
   const storage = window.BLSStorage;
+  if (!shared || !storage) {
+    console.error('声迹：共享常量未加载，请重新加载扩展。');
+    return;
+  }
 
   const state = {
     video: null,
@@ -32,6 +36,7 @@
     highlightedIndex: -1,
     monitorTimer: null,
     videoScanTimer: null,
+    durationTimer: null,
     activeJobId: ''
   };
 
@@ -303,8 +308,33 @@
     useLyrics(parsed, 'LRC 手动导入');
   }
 
+  function firstFinitePositive(values) {
+    for (const value of values) {
+      const number = Number(value);
+      if (Number.isFinite(number) && number > 0) return number;
+    }
+    return 0;
+  }
+
+  function durationFromVideo(video) {
+    if (!video) return 0;
+    const candidates = [video.duration];
+    try {
+      if (video.seekable && video.seekable.length) candidates.push(video.seekable.end(video.seekable.length - 1));
+    } catch (_) {}
+    let duration = firstFinitePositive(candidates);
+    if (duration > 0) return duration;
+    try {
+      if (window.player && typeof window.player.getDuration === 'function') candidates.push(window.player.getDuration());
+    } catch (_) {}
+    duration = firstFinitePositive(candidates);
+    if (duration > 0) return duration;
+    const durationText = document.querySelector('.bpx-player-ctrl-time-duration')?.textContent;
+    return durationText ? parseTime(durationText.trim(), false) || 0 : 0;
+  }
+
   function usableDuration() {
-    return state.video && Number.isFinite(state.video.duration) ? state.video.duration : 0;
+    return durationFromVideo(state.video) || durationFromVideo(findBestVideo());
   }
 
   function fillDefaultRange() {
@@ -312,7 +342,21 @@
     const duration = usableDuration();
     if (duration > 0 && (el.rangeEnd.value === '00:00' || !parseTime(el.rangeEnd.value, false))) {
       el.rangeEnd.value = formatRangeTime(Math.min(Math.ceil(duration), shared.MAX_RANGE_SECONDS));
+      clearRangeError();
     }
+  }
+
+  function watchDuration() {
+    if (state.durationTimer) return;
+    let attempts = 0;
+    state.durationTimer = setInterval(() => {
+      attempts += 1;
+      fillDefaultRange();
+      if (!state.video || usableDuration() > 0 || attempts >= 30) {
+        clearInterval(state.durationTimer);
+        state.durationTimer = null;
+      }
+    }, 1000);
   }
 
   function useCurrentPosition(input) {
@@ -448,11 +492,20 @@
     } catch (_) {}
   }
 
+  function jobIsGone(result) {
+    return /不存在|已过期|not found|expired/i.test(String(result?.error || ''));
+  }
+
   async function cancelJob(jobId, pageKey, attempts = shared.JOB_POLL_MAX_RETRIES) {
     if (!jobId) return true;
     for (let failure = 1; failure <= attempts; failure += 1) {
       const result = await sendMessage({ type: shared.MESSAGE_TYPES.CANCEL_TRANSCRIBE_JOB, jobId });
       if (result?.ok) {
+        await persistActiveJob(pageKey, '');
+        if (state.activeJobId === jobId) state.activeJobId = '';
+        return true;
+      }
+      if (jobIsGone(result)) {
         await persistActiveJob(pageKey, '');
         if (state.activeJobId === jobId) state.activeJobId = '';
         return true;
@@ -476,6 +529,12 @@
         return;
       }
       if (!job?.ok) {
+        if (jobIsGone(job)) {
+          state.activeJobId = '';
+          await persistActiveJob(requestPageKey, '');
+          showFallback('识别任务已失效，请重新获取歌词。', '服务识别失败');
+          return;
+        }
         failures += 1;
         if (shared.shouldRetryJobOperation(job, failures)) {
           el.recognizeStage.textContent = `连接暂时失败，正在重试（${failures}/${shared.JOB_POLL_MAX_RETRIES}）…`;
@@ -766,24 +825,27 @@
     return best;
   }
 
+  const DURATION_EVENTS = ['loadedmetadata', 'loadeddata', 'canplay', 'durationchange'];
+
   function attachVideo(video) {
     if (!video || video === state.video) return;
     if (state.video) {
       state.video.removeEventListener('play', handleVideoPlay);
       state.video.removeEventListener('pause', syncPlayButton);
-      state.video.removeEventListener('loadedmetadata', fillDefaultRange);
       state.video.removeEventListener('timeupdate', monitorPlayback);
+      DURATION_EVENTS.forEach(event => state.video.removeEventListener(event, fillDefaultRange));
     }
     state.video = video;
     state.video.playbackRate = state.speed;
     state.video.addEventListener('play', handleVideoPlay);
     state.video.addEventListener('pause', syncPlayButton);
-    state.video.addEventListener('loadedmetadata', fillDefaultRange);
     state.video.addEventListener('timeupdate', monitorPlayback);
+    DURATION_EVENTS.forEach(event => state.video.addEventListener(event, fillDefaultRange));
     el.videoStatus.classList.add(`${P}connected`);
     el.videoStatus.querySelector('span').textContent = '已连接当前播放器';
     syncPlayButton();
     fillDefaultRange();
+    watchDuration();
   }
 
   function syncPlayButton() {
@@ -925,8 +987,10 @@
     if (!state.video) return;
     state.video.removeEventListener('play', handleVideoPlay);
     state.video.removeEventListener('pause', syncPlayButton);
-    state.video.removeEventListener('loadedmetadata', fillDefaultRange);
     state.video.removeEventListener('timeupdate', monitorPlayback);
+    DURATION_EVENTS.forEach(event => state.video.removeEventListener(event, fillDefaultRange));
+    clearInterval(state.durationTimer);
+    state.durationTimer = null;
     state.video = null;
     updatePlaybackMonitoring();
   }

@@ -17,9 +17,11 @@ manifest.json
 config.js
 background.js
 content.js
+content.css
 protocol.js
 storage.js
 popup.html
+popup.css
 logo.png
 INSTALL.md
 ```

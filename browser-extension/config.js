@@ -2,6 +2,6 @@
   'use strict';
 
   globalThis.BLSConfig = Object.freeze({
-    API_BASE: ''
+    API_BASE: "http://127.0.0.1:8765"
   });
 })();

@@ -11,7 +11,8 @@ from job_manager import JobCancelled, JobManager, JobQueueFull
 from models import TranscribeRequest
 from transcribe_service import infer_metadata_language, parse_bilibili_video_url, resolve_bilibili_audio, transcribe_request
 from server import (
-    _empty_correction, _source_matches_subject, correct_segments_from_web, extract_song_metadata,
+    _allowed_lyrics_host, _clean_video_title, _compact_title_part, _empty_correction, _source_matches_subject,
+    correct_segments_from_web, extract_song_metadata,
     fetch_bilibili_subtitle_candidates, fetch_lrclib_candidates, fetch_netease_candidates,
     sync_lrc_to_audio,
 )
@@ -130,6 +131,13 @@ class CacheTests(unittest.TestCase):
             self.assertFalse(Path(directory, "recent.json").exists())
             self.assertTrue(Path(directory, "new.json").exists())
 
+    def test_disk_write_failure_keeps_memory_entry(self):
+        with tempfile.TemporaryDirectory() as directory:
+            cache = ResultCache(directory, max_entries=2, ttl_seconds=60)
+            with mock.patch.object(cache, "_write_entry", side_effect=OSError("disk full")):
+                cache.set("key", self.make_value())
+                self.assertEqual(cache.get("key"), self.make_value())
+
 
 class BilibiliResolverTests(unittest.TestCase):
     def test_parse_video_and_page(self):
@@ -233,18 +241,60 @@ class TranscribeRequestTests(unittest.TestCase):
             "video_info": {"title": "此生不换", "uploader": "青鸟飞鱼"},
         }
 
-        with mock.patch("transcribe_service.resolve_bilibili_audio", return_value=bilibili_source):
-            transcribe_request(
-                TranscribeRequest(url="https://www.bilibili.com/video/BV1abc", start=0, end=10, language="auto"),
-                **dependencies,
-            )
-            transcribe_request(
-                TranscribeRequest(url="https://www.bilibili.com/video/BV1abc", start=0, end=10, language="en"),
-                **dependencies,
-            )
+        downloaded = Path(tempfile.gettempdir()) / "sing-reactor-test-audio.m4a"
+        downloaded.write_bytes(b"audio")
+        fake_downloader = mock.MagicMock()
+        fake_downloader.__enter__.return_value.extract_info.return_value = {
+            "requested_downloads": [{"filepath": str(downloaded)}],
+        }
+        try:
+            with mock.patch("transcribe_service.resolve_bilibili_audio", return_value=bilibili_source), \
+                 mock.patch("transcribe_service.YoutubeDL", return_value=fake_downloader) as downloader_factory:
+                transcribe_request(
+                    TranscribeRequest(url="https://www.bilibili.com/video/BV1abc", start=0, end=10, language="auto"),
+                    **dependencies,
+                )
+                transcribe_request(
+                    TranscribeRequest(url="https://www.bilibili.com/video/BV1abc", start=0, end=10, language="en"),
+                    **dependencies,
+                )
+        finally:
+            downloaded.unlink(missing_ok=True)
 
         self.assertEqual(run_model.call_args_list[0].args[1], "zh")
         self.assertEqual(run_model.call_args_list[1].args[1], "en")
+        downloader_options = downloader_factory.call_args.args[0]
+        self.assertEqual(downloader_options["http_headers"], bilibili_source["headers"])
+        self.assertNotIn("download_ranges", downloader_options)
+        fake_downloader.__enter__.return_value.extract_info.assert_called_with(
+            bilibili_source["audio_url"], download=True,
+        )
+        ffmpeg_args = dependencies["run_command"].call_args_list[0].args[0]
+        self.assertIn(str(downloaded), ffmpeg_args)
+        self.assertNotIn(bilibili_source["audio_url"], ffmpeg_args)
+
+
+class TitleCleanupTests(unittest.TestCase):
+    def test_noise_terms_respect_word_boundaries(self):
+        for title in ("Deliver Us", "Slow Motion", "Lyrical Ballad", "HDMI cable"):
+            with self.subTest(title=title):
+                self.assertEqual(_clean_video_title(title), title)
+
+    def test_standalone_quality_tags_are_removed(self):
+        self.assertEqual(_clean_video_title("Official Live Video"), "Official Video")
+        self.assertEqual(_clean_video_title("4K song"), "song")
+
+    def test_ambiguous_chinese_terms_need_tag_context(self):
+        self.assertEqual(_clean_video_title("《发现》"), "《发现》")
+        self.assertEqual(_clean_video_title("胡歌 发现"), "胡歌 发现")
+        self.assertEqual(_clean_video_title("我的收藏夹"), "我的收藏夹")
+        self.assertEqual(_clean_video_title("【伴奏】夜曲"), "夜曲")
+        self.assertEqual(_clean_video_title("某歌 - 字幕版"), "某歌")
+        self.assertEqual(_clean_video_title("成都 现场版"), "成都")
+
+    def test_bracketed_song_title_survives_cleaning(self):
+        self.assertEqual(_clean_video_title("【发现】"), "【发现】")
+        self.assertEqual(_compact_title_part("【发现】"), "发现")
 
 
 class LrclibCandidateTests(unittest.TestCase):
@@ -256,6 +306,44 @@ class LrclibCandidateTests(unittest.TestCase):
         metadata = extract_song_metadata("【4K/歌词字幕】黄霄雲—《此生不换》-20260829宇宙无敌号2.0杭州演唱会")
         self.assertEqual(metadata["artist"], "黄霄雲")
         self.assertEqual(metadata["song_title"], "此生不换")
+
+    def test_title_extracts_trailing_artist_after_promotional_prefix(self):
+        info = {
+            "title": "在百万豪装录音棚大声听 仙剑奇侠传1ost 胡歌《逍遥叹》【Hi-res】",
+            "description": "《逍遥叹》由胡歌演唱。",
+        }
+        metadata = extract_song_metadata(info["title"], video_info=info)
+        self.assertEqual(metadata["artist"], "胡歌")
+        self.assertEqual(metadata["song_title"], "逍遥叹")
+
+    def test_description_artist_metadata_overrides_promotional_title_prefix(self):
+        info = {
+            "title": "在百万豪装录音棚大声听 仙剑奇侠传1ost 胡歌《逍遥叹》",
+            "description": "歌曲：逍遥叹\n歌手：胡歌",
+        }
+        metadata = extract_song_metadata(info["title"], video_info=info)
+        self.assertEqual(metadata["artist"], "胡歌")
+
+    def test_part_index_title_uses_book_title_and_skips_description_prose(self):
+        info = {
+            "title": "来迟_1",
+            "page_title": "来迟_1",
+            "total_title": "【无损音质】戴羽彤《来迟》4K画质「我这一次终究还是来的太迟」动态歌词版",
+            "original_title": "【无损音质】戴羽彤《来迟》4K画质「我这一次终究还是来的太迟」动态歌词版",
+            "description": "特别声明：\n⚠歌曲版权为歌手本人及其音乐公司所有，若喜欢他们的音乐请支持正版",
+            "uploader": "索性自挂东南枝",
+        }
+        metadata = extract_song_metadata(info["title"], video_info=info)
+        self.assertEqual(metadata["song_title"], "来迟")
+        self.assertEqual(metadata["artist"], "戴羽彤")
+
+    def test_description_prose_without_label_is_not_artist(self):
+        info = {
+            "title": "来迟",
+            "description": "歌曲版权为歌手本人及其音乐公司所有，若喜欢他们的音乐请支持正版",
+        }
+        metadata = extract_song_metadata(info["title"], video_info=info)
+        self.assertNotEqual(metadata["artist"], "本人及其音乐公司所有")
 
     def test_metadata_similarity_precedes_duration_and_filters_wrong_track(self):
         items = [
@@ -295,6 +383,11 @@ class LrclibCandidateTests(unittest.TestCase):
 
 
 class UnifiedLyricsTests(unittest.TestCase):
+    def test_bilibili_subtitle_hosts_are_allowlisted(self):
+        self.assertTrue(_allowed_lyrics_host("api.bilibili.com"))
+        self.assertTrue(_allowed_lyrics_host("aisubtitle.hdslb.com"))
+        self.assertFalse(_allowed_lyrics_host("bilibili.com.evil.example"))
+
     def test_bilibili_subtitle_priority_and_parse(self):
         listing = {"data": {"subtitle": {"subtitles": [
             {"lan": "en", "lan_doc": "English", "subtitle_url": "//sub/en"},
@@ -458,6 +551,13 @@ class ServerAuthTests(unittest.TestCase):
             headers={"X-Sing-Reactor-Token": self.server._API_TOKEN},
         )
         self.assertEqual(accepted.status_code, 404)
+
+    def test_non_ascii_token_is_rejected_without_server_error(self):
+        from fastapi import HTTPException
+
+        with self.assertRaises(HTTPException) as raised:
+            self.server._require_token("tökén")
+        self.assertEqual(raised.exception.status_code, 401)
 
 
 class ServerConcurrencyTests(unittest.TestCase):

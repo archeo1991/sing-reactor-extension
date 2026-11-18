@@ -19,6 +19,7 @@ import threading
 import time
 import xml.etree.ElementTree as ET
 from difflib import SequenceMatcher
+from functools import lru_cache
 from html.parser import HTMLParser
 from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, quote_plus, unquote, urlencode, urljoin, urlparse
@@ -41,6 +42,7 @@ from transcribe_service import MODEL_TRANSCRIBE_PARAMS, transcribe_request
 logger = logging.getLogger("sing_reactor.server")
 
 
+@lru_cache(maxsize=None)
 def _cfg(path, expected_type=None):
     value = LYRICS_CONFIG
     traversed = []
@@ -52,8 +54,16 @@ def _cfg(path, expected_type=None):
             value = value[int(part)]
         else:
             raise KeyError(f"缺少歌词配置项 {'.'.join(traversed)}")
-    if expected_type is not None and (not isinstance(value, expected_type) or expected_type in (int, float) and isinstance(value, bool)):
-        expected_name = getattr(expected_type, "__name__", str(expected_type))
+    numeric_expected = expected_type in (int, float) or (
+        isinstance(expected_type, tuple) and all(item in (int, float) for item in expected_type)
+    )
+    if expected_type is not None and (
+        not isinstance(value, expected_type) or numeric_expected and isinstance(value, bool)
+    ):
+        if isinstance(expected_type, tuple):
+            expected_name = "/".join(getattr(item, "__name__", str(item)) for item in expected_type)
+        else:
+            expected_name = getattr(expected_type, "__name__", str(expected_type))
         raise TypeError(f"歌词配置项 {path} 必须是 {expected_name}")
     return value
 
@@ -85,7 +95,8 @@ if _cfg("schema_version", int) != 1:
 for _section in ("title_cleanup", "uploader", "metadata", "search", "candidate_filter", "script_tracks", "lrc_sync", "provider_quality", "timeline_quality", "fallback"):
     _cfg(_section, dict)
 for _path in (
-    "title_cleanup.removable_terms", "title_cleanup.date_patterns", "title_cleanup.venue_suffix_patterns",
+    "title_cleanup.removable_terms", "title_cleanup.contextual_terms",
+    "title_cleanup.date_patterns", "title_cleanup.venue_suffix_patterns",
     "uploader.trusted_official_markers", "metadata.bracket_patterns",
     "metadata.discovery_title_patterns", "metadata.artist_title_separators",
     "script_tracks.priority", "candidate_filter.metadata_line_patterns", "candidate_filter.noise_patterns",
@@ -158,6 +169,7 @@ DEFAULT_LYRICS_HOSTS = (
     "lrclib.net", "www.bing.com", "html.duckduckgo.com", "genius.com", "musixmatch.com",
     "azlyrics.com", "lyrics.com", "lyricsfreak.com", "songlyrics.com", "lyricstranslate.com",
     "mojim.com", "kkbox.com", "kugou.com", "kuwo.cn", "music.163.com", "qq.com",
+    "bilibili.com", "hdslb.com",
 )
 ALLOWED_LYRICS_HOSTS = frozenset(DEFAULT_LYRICS_HOSTS + SETTINGS.allowed_lyrics_hosts)
 
@@ -318,7 +330,8 @@ def _is_extension_origin(origin):
 
 
 def _require_token(token):
-    if not token or not hmac.compare_digest(token, _API_TOKEN):
+    supplied = token.encode("utf-8") if token else b""
+    if not supplied or not hmac.compare_digest(supplied, _API_TOKEN.encode("utf-8")):
         raise HTTPException(status_code=401, detail="API token 无效")
 
 
@@ -421,6 +434,7 @@ def run_model_transcription(wav_path, language, vad_filter, cancel_event, deadli
 
 
 TITLE_NOISE_RE = _compile_cfg_patterns("title_cleanup.removable_terms")
+CONTEXTUAL_TITLE_NOISE_RE = _compile_cfg_patterns("title_cleanup.contextual_terms")
 DATE_RE = _compile_cfg_patterns("title_cleanup.date_patterns")
 VENUE_SUFFIX_RE = _compile_cfg_patterns("title_cleanup.venue_suffix_patterns")
 ARTIST_HINT_RE = _compile_cfg_patterns("uploader.trusted_official_markers")
@@ -435,17 +449,57 @@ MINIMUM_PIECE_DURATION = _cfg_number("lrc_sync.minimum_piece_duration")
 LINE_END_PADDING = _cfg_number("lrc_sync.line_end_padding")
 
 
+_TITLE_WORD_RE = re.compile(r"[0-9A-Za-z\u3400-\u9fff]")
+_TITLE_DELIMITERS = frozenset("|｜丨/／\\-_—–~·:：,，、")
+_TITLE_BRACKETS = frozenset("【】[]（）()")
+
+
+def _title_side_is_delimited(text, position, step):
+    while 0 <= position < len(text) and text[position].isspace():
+        position += step
+    if not 0 <= position < len(text):
+        return False
+    return text[position] in _TITLE_DELIMITERS or text[position] in _TITLE_BRACKETS
+
+
+def _contextual_title_match(text, match):
+    before = text[match.start() - 1] if match.start() else ""
+    after = text[match.end()] if match.end() < len(text) else ""
+    if before == "《" or after == "》":
+        return False
+    if (before and _TITLE_WORD_RE.match(before)) or (after and _TITLE_WORD_RE.match(after)):
+        return False
+    return (
+        _title_side_is_delimited(text, match.start() - 1, -1)
+        or _title_side_is_delimited(text, match.end(), 1)
+    )
+
+
+def _strip_contextual_title_noise(value):
+    text = str(value or "")
+    for match in reversed(list(CONTEXTUAL_TITLE_NOISE_RE.finditer(text))):
+        if _contextual_title_match(text, match):
+            text = text[:match.start()] + " " + text[match.end():]
+    return text
+
+
 def _compact_title_part(value):
-    value = TITLE_NOISE_RE.sub(" ", str(value or ""))
+    original = str(value or "")
+    value = _strip_contextual_title_noise(original)
+    value = TITLE_NOISE_RE.sub(" ", value)
     value = DATE_RE.sub(" ", value)
     value = VENUE_SUFFIX_RE.sub(" ", value)
     value = re.sub(r"[【】\[\]（）(){}]+", " ", value)
     value = re.sub(r"(?:\+|/)+", " ", value)
-    return re.sub(r"\s+", " ", value).strip(" -_·:：—–")
+    compacted = re.sub(r"\s+", " ", value).strip(" -_·:：—–")
+    if compacted:
+        return compacted
+    return re.sub(r"\s+", " ", re.sub(r"[【】\[\]（）(){}]+", " ", original)).strip(" -_·:：—–")
 
 
 def _clean_video_title(title):
-    value = html.unescape(str(title or ""))
+    original = html.unescape(str(title or ""))
+    value = _strip_contextual_title_noise(original)
 
     def clean_bracket(match):
         content = next(part for part in match.groups() if part is not None)
@@ -457,7 +511,7 @@ def _clean_video_title(title):
     value = TITLE_NOISE_RE.sub(" ", value)
     value = re.sub(r"[｜|丨]+", " - ", value)
     value = re.sub(r"\s*[-—–_:：]+\s*", " - ", value)
-    return re.sub(r"\s+", " ", value).strip(" -_·")[:120]
+    return re.sub(r"\s+", " ", value).strip(" -_·")[:120] or original.strip()[:120]
 
 
 def _metadata_text_values(video_info):
@@ -489,6 +543,31 @@ def _explicit_song_from_metadata(video_info):
             match = pattern.search(value)
             if match:
                 return _compact_title_part(match.group(1))
+    return ""
+
+
+def _explicit_artist_from_metadata(video_info):
+    info = video_info or {}
+    for key in ("artist", "album_artist", "creator"):
+        value = _compact_title_part(info.get(key))
+        if value:
+            return value
+    for value in _metadata_text_values(info):
+        text = str(value or "")
+        match = re.search(
+            r"(?:歌手|演唱者|演唱人|演唱)\s*[:：]\s*([A-Za-z0-9\u3400-\u9fff·]{2,40})",
+            text,
+            re.I,
+        )
+        if match:
+            return _compact_title_part(match.group(1))
+        match = re.search(
+            r"(?:由|是)?\s*([A-Za-z0-9\u3400-\u9fff·]{2,40})\s*演唱",
+            text,
+            re.I,
+        )
+        if match:
+            return _compact_title_part(match.group(1))
     return ""
 
 
@@ -539,6 +618,14 @@ def _extract_artist_and_song(title, uploader="", video_info=None):
             )
             if presenter_match:
                 artist = presenter_match.group(1)
+            else:
+                trailing_artist = re.search(
+                    r"([A-Za-z0-9\u3400-\u9fff·]{2,40})\s*$",
+                    artist,
+                    re.I,
+                )
+                if trailing_artist:
+                    artist = trailing_artist.group(1)
         elif suffix:
             artist = ARTIST_TITLE_SEPARATOR_RE.split(suffix)[0].strip()
     else:
@@ -557,13 +644,19 @@ def _extract_artist_and_song(title, uploader="", video_info=None):
             song = cleaned
 
     metadata_song = _explicit_song_from_metadata(video_info)
-    if metadata_song and (not song or normalize_lyric_text(metadata_song) in normalize_lyric_text(song)):
+    if metadata_song and (
+        not song
+        or not re.search(r"[A-Za-z\u3400-\u9fff]", song)
+        or normalize_lyric_text(metadata_song) in normalize_lyric_text(song)
+    ):
         song = metadata_song
     artist = _compact_title_part(artist)
     song = _compact_title_part(song)
-    if not artist:
-        explicit_artists = [str((video_info or {}).get(key) or "") for key in ("artist", "album_artist", "creator")]
-        artist = next((value for value in explicit_artists if value), "")
+    explicit_artist = _explicit_artist_from_metadata(video_info)
+    if explicit_artist:
+        artist = explicit_artist
+    if artist and normalize_lyric_text(artist) == normalize_lyric_text(song):
+        artist = ""
     if not artist:
         info = video_info or {}
         alternate_info = {key: value for key, value in info.items()
@@ -575,10 +668,10 @@ def _extract_artist_and_song(title, uploader="", video_info=None):
                 if alternate_artist:
                     artist = alternate_artist
                     break
-    if not artist:
-        artist = _trusted_uploader_artist(uploader, original, [])
     if artist and normalize_lyric_text(artist) == normalize_lyric_text(song):
         artist = ""
+    if not artist:
+        artist = _trusted_uploader_artist(uploader, original, [])
     return artist[:80], song[:120]
 
 
@@ -1565,20 +1658,24 @@ def fetch_bilibili_subtitle_candidates(video_info, deadline=None):
     except (HTTPError, URLError, OSError, ValueError, UnicodeError):
         return []
     subtitles = (((payload.get("data") or {}).get("subtitle") or {}).get("subtitles") or [])
+    if not isinstance(subtitles, list):
+        return []
     candidates = []
     for item in subtitles:
         label = str(item.get("lan_doc") or item.get("lan") or "")
         sub_url = item.get("subtitle_url") or ""
         if sub_url.startswith("//"):
             sub_url = "https:" + sub_url
-        elif sub_url.startswith("/"):
-            sub_url = urljoin("https://www.bilibili.com", sub_url)
+        else:
+            sub_url = urljoin("https://www.bilibili.com/", sub_url)
         if not sub_url:
             continue
         try:
             body, final_url = _fetch_public_text(sub_url, PAGE_TIMEOUT, MAX_PAGE_BYTES, {"application/json", "text/json", "text/plain"}, deadline)
             entries = (json.loads(body).get("body") or [])
         except (HTTPError, URLError, OSError, ValueError, UnicodeError):
+            continue
+        if not isinstance(entries, list):
             continue
         lrc_lines = []
         plain_lines = []
@@ -1614,6 +1711,8 @@ def fetch_netease_candidates(metadata, deadline=None):
         raw, _ = _fetch_public_text(search_url, SEARCH_TIMEOUT, MAX_SEARCH_BYTES, {"application/json", "text/json", "text/plain"}, deadline)
         songs = ((json.loads(raw).get("result") or {}).get("songs") or [])
     except (HTTPError, URLError, OSError, ValueError, UnicodeError):
+        return []
+    if not isinstance(songs, list):
         return []
     candidates = []
     for song in songs[:_cfg("search.netease_max_results", int)]:

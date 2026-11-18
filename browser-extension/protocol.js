@@ -3,7 +3,7 @@
 
   const config = globalThis.BLSConfig || {};
   const apiBase = String(config.API_BASE || '').replace(/\/+$/, '');
-  if (!apiBase) throw new Error('缺少 API_BASE 配置，请使用 build-release.ps1 生成扩展包。');
+  const missingApiBaseMessage = '缺少 API_BASE 配置，请使用 build-release.ps1 生成扩展包，或在 config.js 中填写服务地址。';
 
   globalThis.BLSShared = Object.freeze({
     STORAGE_PREFIX: 'bls-data:',
@@ -12,6 +12,11 @@
     MAX_RANGE_SECONDS: 15 * 60,
     MIN_LINE_DURATION: 0.1,
     API_BASE: apiBase,
+    API_BASE_MISSING_MESSAGE: missingApiBaseMessage,
+    requireApiBase() {
+      if (!apiBase) throw new Error(missingApiBaseMessage);
+      return apiBase;
+    },
     TOKEN_STORAGE_KEY: 'singReactorApiToken',
     ACTIVE_JOBS_STORAGE_KEY: 'bls-active-jobs',
     JOB_POLL_INTERVAL_MS: 1200,

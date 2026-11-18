@@ -15,8 +15,19 @@ try {
     $Host.UI.RawUI.WindowTitle = "声迹本地识别服务"
     Set-Location -LiteralPath $scriptRoot
 
+    $serverPort = if ($env:SING_REACTOR_PORT -match '^\d+$') { [int]$env:SING_REACTOR_PORT } else { 8765 }
+    $serviceHost = if ($env:SING_REACTOR_HOST -and $env:SING_REACTOR_HOST -notin @('0.0.0.0', '::')) {
+        $env:SING_REACTOR_HOST
+    } else {
+        '127.0.0.1'
+    }
+    if ($serviceHost.Contains(':')) {
+        $serviceHost = "[$serviceHost]"
+    }
+    $serviceUrl = "http://${serviceHost}:${serverPort}"
+
     try {
-        $healthResponse = Invoke-WebRequest -Uri "http://127.0.0.1:8765/health" -UseBasicParsing -TimeoutSec 3
+        $healthResponse = Invoke-WebRequest -Uri "$serviceUrl/health" -UseBasicParsing -TimeoutSec 3
         $health = $healthResponse.Content | ConvertFrom-Json
         if ($health.ok) {
             Write-Host "服务已经运行" -ForegroundColor Green
@@ -47,7 +58,7 @@ try {
         }
     }
 
-    & $venvPython -c "import fastapi, uvicorn, yt_dlp, faster_whisper" 2>$null
+    & $venvPython -c "import fastapi, uvicorn, yt_dlp, faster_whisper, huggingface_hub" 2>$null
     if ($LASTEXITCODE -ne 0) {
         $requirements = Join-Path $scriptRoot "requirements.txt"
         if (-not (Test-Path -LiteralPath $requirements -PathType Leaf)) {
@@ -92,7 +103,7 @@ try {
     $env:WHISPER_VAD_FILTER = "false"
     $env:PYTHONDONTWRITEBYTECODE = "1"
 
-    Write-Host "正在启动服务：http://127.0.0.1:8765" -ForegroundColor Cyan
+    Write-Host "正在启动服务：$serviceUrl" -ForegroundColor Cyan
     & $venvPython (Join-Path $scriptRoot "server.py")
     if ($LASTEXITCODE -ne 0) {
         throw "本地识别服务异常退出（退出码：$LASTEXITCODE）。"

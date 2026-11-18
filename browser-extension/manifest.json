@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "声迹",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "声迹帮助你在 B站视频与番剧页面听见每一句，唱准每一拍。",
   "icons": {
     "16": "logo.png",
@@ -12,7 +12,8 @@
   "permissions": ["storage"],
   "host_permissions": [
     "https://api.bilibili.com/*",
-    "https://*.hdslb.com/*"
+    "https://*.hdslb.com/*",
+    "http://127.0.0.1:8765/*"
   ],
   "background": {
     "service_worker": "background.js"
