@@ -5,6 +5,7 @@ import time
 import unittest
 from pathlib import Path
 from unittest import mock
+from urllib.error import HTTPError
 
 from cache import ResultCache
 from job_manager import JobCancelled, JobManager, JobQueueFull
@@ -175,6 +176,40 @@ class BilibiliResolverTests(unittest.TestCase):
         self.assertIn("歌曲：此生不换", info["description"])
         self.assertEqual(info["categories"], ["音乐综合"])
         self.assertIn("cid=22", opened.call_args_list[1].args[0].full_url)
+
+    def test_resolve_falls_back_to_pagelist_when_view_is_blocked(self):
+        pages = [
+            {"page": 1, "cid": 11, "part": "第一段", "duration": 10},
+            {"page": 2, "cid": 22, "part": "第二段", "duration": 20},
+        ]
+        playback = {
+            "dash": {"audio": [{"bandwidth": 128000, "baseUrl": "https://cdn/high.m4s"}]},
+        }
+        blocked = HTTPError(
+            "https://api.bilibili.com/x/web-interface/view?bvid=BV1sc411V7ZE",
+            412,
+            "Precondition Failed",
+            None,
+            None,
+        )
+
+        with mock.patch(
+            "transcribe_service._get_bilibili_json",
+            side_effect=[blocked, pages, playback],
+        ) as fetch:
+            result = resolve_bilibili_audio(
+                "https://www.bilibili.com/video/BV1sc411V7ZE?p=2", 10
+            )
+
+        info = result["video_info"]
+        self.assertEqual(result["audio_url"], "https://cdn/high.m4s")
+        self.assertEqual(info["cid"], 22)
+        self.assertEqual(info["title"], "第二段")
+        self.assertEqual(info["page_title"], "第二段")
+        self.assertEqual(info["duration"], 20)
+        self.assertEqual(info["total_duration"], 30)
+        self.assertIn("x/player/pagelist", fetch.call_args_list[1].args[0])
+        self.assertIn(22, fetch.call_args_list[2].args[1].values())
 
     def test_bv1my411w7ai_metadata_uses_page_and_total_title(self):
         info = {

@@ -90,8 +90,23 @@ def resolve_bilibili_audio(url, timeout):
     if not parsed:
         return None
     bvid, page_number = parsed
-    video = _get_bilibili_json("https://api.bilibili.com/x/web-interface/view", {"bvid": bvid}, timeout)
-    pages = video.get("pages") or []
+    try:
+        video = _get_bilibili_json(
+            "https://api.bilibili.com/x/web-interface/view", {"bvid": bvid}, timeout
+        )
+        pages = video.get("pages") or []
+    except (HTTPError, URLError, ValueError):
+        video = {}
+        pages = []
+    if not isinstance(pages, list):
+        pages = []
+    if not pages:
+        try:
+            pages = _get_bilibili_json(
+                "https://api.bilibili.com/x/player/pagelist", {"bvid": bvid}, timeout
+            )
+        except (HTTPError, URLError, ValueError) as exc:
+            raise ValueError("Bilibili API 未返回有效分P信息") from exc
     if not isinstance(pages, list):
         pages = []
     page = next((item for item in pages if item.get("page") == page_number), None)
@@ -117,6 +132,13 @@ def resolve_bilibili_audio(url, timeout):
     page_title = str(page.get("part") or "")
     page_duration = page.get("duration")
     total_duration = video.get("duration")
+    if total_duration is None and pages:
+        known_durations = [
+            item.get("duration") for item in pages
+            if isinstance(item.get("duration"), (int, float))
+        ]
+        if known_durations:
+            total_duration = sum(known_durations)
     return {
         "audio_url": audio_url, "headers": BILIBILI_HEADERS,
         "video_info": {
