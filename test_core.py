@@ -241,37 +241,23 @@ class TranscribeRequestTests(unittest.TestCase):
             "video_info": {"title": "此生不换", "uploader": "青鸟飞鱼"},
         }
 
-        downloaded = Path(tempfile.gettempdir()) / "sing-reactor-test-audio.m4a"
-        downloaded.write_bytes(b"audio")
-        fake_downloader = mock.MagicMock()
-        fake_downloader.__enter__.return_value.extract_info.return_value = {
-            "requested_downloads": [{"filepath": str(downloaded)}],
-        }
-        try:
-            with mock.patch("transcribe_service.resolve_bilibili_audio", return_value=bilibili_source), \
-                 mock.patch("transcribe_service.YoutubeDL", return_value=fake_downloader) as downloader_factory:
-                transcribe_request(
-                    TranscribeRequest(url="https://www.bilibili.com/video/BV1abc", start=0, end=10, language="auto"),
-                    **dependencies,
-                )
-                transcribe_request(
-                    TranscribeRequest(url="https://www.bilibili.com/video/BV1abc", start=0, end=10, language="en"),
-                    **dependencies,
-                )
-        finally:
-            downloaded.unlink(missing_ok=True)
+        with mock.patch("transcribe_service.resolve_bilibili_audio", return_value=bilibili_source), \
+             mock.patch("transcribe_service.YoutubeDL") as downloader_factory:
+            transcribe_request(
+                TranscribeRequest(url="https://www.bilibili.com/video/BV1abc", start=0, end=10, language="auto"),
+                **dependencies,
+            )
+            transcribe_request(
+                TranscribeRequest(url="https://www.bilibili.com/video/BV1abc", start=0, end=10, language="en"),
+                **dependencies,
+            )
 
         self.assertEqual(run_model.call_args_list[0].args[1], "zh")
         self.assertEqual(run_model.call_args_list[1].args[1], "en")
-        downloader_options = downloader_factory.call_args.args[0]
-        self.assertEqual(downloader_options["http_headers"], bilibili_source["headers"])
-        self.assertNotIn("download_ranges", downloader_options)
-        fake_downloader.__enter__.return_value.extract_info.assert_called_with(
-            bilibili_source["audio_url"], download=True,
-        )
+        downloader_factory.assert_not_called()
         ffmpeg_args = dependencies["run_command"].call_args_list[0].args[0]
-        self.assertIn(str(downloaded), ffmpeg_args)
-        self.assertNotIn(bilibili_source["audio_url"], ffmpeg_args)
+        self.assertIn(bilibili_source["audio_url"], ffmpeg_args)
+        self.assertIn("-headers", ffmpeg_args)
 
 
 class TitleCleanupTests(unittest.TestCase):
